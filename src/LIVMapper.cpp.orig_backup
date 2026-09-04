@@ -11,74 +11,6 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
-#include "flivo_trace.h"
-
-namespace flivo_trace
-{
-static uint64_t hashCloud(const PointCloudXYZI::Ptr &c)
-{
-  if (!c || c->empty()) return 0;
-  uint64_t h = 1469598103934665603ULL;
-  for (const auto &pt : c->points)
-  {
-    double v[4] = {pt.x, pt.y, pt.z, pt.curvature};
-    h = hashBytes(v, sizeof(v), h);
-  }
-  return h;
-}
-
-static uint64_t hashMat(const cv::Mat &m)
-{
-  if (m.empty()) return 0;
-  uint64_t h = 1469598103934665603ULL;
-  for (int r = 0; r < m.rows; r++) h = hashBytes(m.ptr(r), m.cols * m.elemSize(), h);
-  return h;
-}
-
-static void state(const char *tag, int frame, const StatesGroup &s)
-{
-  if (!on()) return;
-  std::ofstream &f = stream();
-  f << frame << " " << tag << std::scientific << std::setprecision(17);
-  for (int i = 0; i < 3; i++) f << " " << s.pos_end[i];
-  for (int i = 0; i < 3; i++) f << " " << s.vel_end[i];
-  for (int i = 0; i < 9; i++) f << " " << s.rot_end.data()[i];
-  for (int i = 0; i < 3; i++) f << " " << s.bias_g[i];
-  for (int i = 0; i < 3; i++) f << " " << s.bias_a[i];
-  f << " " << s.inv_expo_time << " " << s.cov.trace() << "\n";
-  f.unsetf(std::ios::scientific);
-}
-
-static void inputs(int frame, const LidarMeasureGroup &m)
-{
-  if (!on()) return;
-  std::ofstream &f = stream();
-  uint64_t imgh = 0, imuh = 1469598103934665603ULL;
-  size_t nimu = 0;
-  if (!m.measures.empty())
-  {
-    imgh = hashMat(m.measures.back().img);
-    for (const auto &im : m.measures.back().imu)
-    {
-      double v[7] = {im->header.stamp.toSec(),
-                     im->linear_acceleration.x, im->linear_acceleration.y, im->linear_acceleration.z,
-                     im->angular_velocity.x, im->angular_velocity.y, im->angular_velocity.z};
-      imuh = hashBytes(v, sizeof(v), imuh);
-      nimu++;
-    }
-  }
-  f << frame << " INPUT flg=" << (int)m.lio_vio_flg
-    << " ncur=" << (m.pcl_proc_cur ? m.pcl_proc_cur->size() : 0)
-    << " nnext=" << (m.pcl_proc_next ? m.pcl_proc_next->size() : 0)
-    << " nimu=" << nimu
-    << " hcur=" << hashCloud(m.pcl_proc_cur)
-    << " himu=" << imuh
-    << " himg=" << imgh
-    << std::scientific << std::setprecision(17)
-    << " tlio=" << m.last_lio_update_time << "\n";
-  f.unsetf(std::ios::scientific);
-}
-} // namespace flivo_trace
 
 LIVMapper::LIVMapper(ros::NodeHandle &nh)
     : extT(0, 0, 0),
@@ -370,11 +302,9 @@ void LIVMapper::handleVIO()
     vio_manager->plot_flag = false;
   }
 
-  flivo_trace::state("pre_vio", -1, _state);
   vio_manager->processFrame(LidarMeasures.measures.back().img, _pv_list, voxelmap_manager->voxel_map_, LidarMeasures.last_lio_update_time - _first_lidar_time);
-  flivo_trace::state("post_vio", -1, _state);
 
-  if (imu_prop_enable)
+  if (imu_prop_enable) 
   {
     ekf_finish_once = true;
     latest_ekf_state = _state;
@@ -607,27 +537,18 @@ void LIVMapper::run()
   while (ros::ok()) 
   {
     ros::spinOnce();
-    if (!sync_packages(LidarMeasures))
+    if (!sync_packages(LidarMeasures)) 
     {
       rate.sleep();
       continue;
     }
-    static int trace_frame = 0;
-    ++trace_frame;
-    flivo_trace::inputs(trace_frame, LidarMeasures);
-    flivo_trace::state("pre_imu", trace_frame, _state);
-
     handleFirstFrame();
 
     processImu();
 
-    flivo_trace::state("post_imu", trace_frame, _state);
-
     // if (!p_imu->imu_time_init) continue;
 
     stateEstimationAndMapping();
-
-    flivo_trace::state("post_est", trace_frame, _state);
   }
   savePCD();
 }

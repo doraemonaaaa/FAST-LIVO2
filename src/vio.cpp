@@ -11,6 +11,10 @@ which is included as part of this source code package.
 */
 
 #include "vio.h"
+#include "flivo_trace.h"
+
+static long flivo_oob_count = 0;   // patches whose reads fall outside the image
+static long flivo_patch_count = 0; // patches evaluated (diagnostic only)
 
 VIOManager::VIOManager()
 {
@@ -796,6 +800,9 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
     }
     else
       updateState(img, level);
+    flivo_trace::raw("vio_level", -2, level, state->pos_end[0], state->pos_end[1],
+                     flivo_trace::hashBytes(state->pos_end.data(), 3 * sizeof(double)));
+    flivo_trace::raw("vio_oob", -2, level, (double)flivo_oob_count, (double)flivo_patch_count, 0);
   }
   state->cov -= G * state->cov;
   updateFrameState(*state);
@@ -1533,6 +1540,14 @@ void VIOManager::updateState(cv::Mat img, int level)
   H_sub.resize(H_DIM, 7);
   H_sub.setZero();
 
+  // Per-point accumulators. `error` used to be an OpenMP reduction, whose
+  // summation order follows thread completion and therefore varies run to run.
+  // A ~1e-18 difference there is enough to flip the `error <= last_error` test
+  // below, so each point writes its own slot and the totals are summed serially
+  // in index order — deterministic, and bit-identical to a single-threaded run.
+  vector<float> error_i(total_points, 0.0f);
+  vector<int> n_meas_i(total_points, 0);
+
   for (int iteration = 0; iteration < max_iterations; iteration++)
   {
     double t1 = omp_get_wtime();
@@ -1545,13 +1560,15 @@ void VIOManager::updateState(cv::Mat img, int level)
     
     float error = 0.0;
     int n_meas = 0;
+    std::fill(error_i.begin(), error_i.end(), 0.0f);
+    std::fill(n_meas_i.begin(), n_meas_i.end(), 0);
     // int max_threads = omp_get_max_threads();
     // int desired_threads = std::min(max_threads, total_points);
     // omp_set_num_threads(desired_threads);
-  
+
     #ifdef MP_EN
       omp_set_num_threads(MP_PROC_NUM);
-      #pragma omp parallel for reduction(+:error, n_meas)
+      #pragma omp parallel for
     #endif
     for (int i = 0; i < total_points; i++)
     {
@@ -1561,6 +1578,7 @@ void VIOManager::updateState(cv::Mat img, int level)
       MD(1, 3) Jdphi, Jdp, JdR, Jdt;
 
       float patch_error = 0.0;
+      int patch_n_meas = 0;
       int search_level = visual_submap->search_levels[i];
       int pyramid_level = level + search_level;
       int scale = (1 << pyramid_level);
@@ -1587,6 +1605,29 @@ void VIOManager::updateState(cv::Mat img, int level)
       float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
       float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
       float w_ref_br = subpix_u_ref * subpix_v_ref;
+
+      {
+        // The patch loop below indexes img.data with raw pointer arithmetic.
+        // Admission used border = (patch_size_half+1) << patch_pyrimid_level,
+        // but the reach here is patch_size_half*scale plus a 2*scale gradient
+        // stencil, and scale = 1 << (level + search_level) can exceed that, so
+        // points 80-192 px from the edge read outside the buffer. Those reads
+        // return unrelated heap bytes, which differ run to run and flip the
+        // `error <= last_error` accept/reject test below. Skip such points.
+        const long W = width, H = height;
+        long base = (long)(v_ref_i - patch_size_half * scale) * W + (u_ref_i - patch_size_half * scale);
+        long lo = base - (long)scale * W - scale;
+        long hi = base + (long)(patch_size - 1) * scale * W + (long)(patch_size - 1) * scale
+                  + 2L * scale * W + 2L * scale;
+        if (lo < 0 || hi >= W * H)
+        {
+          #pragma omp atomic
+          flivo_oob_count++;
+          continue;
+        }
+        #pragma omp atomic
+        flivo_patch_count++;
+      }
 
       vector<float> P = visual_submap->warp_patch[i];
       double inv_ref_expo = visual_submap->inv_expo_list[i];
@@ -1623,15 +1664,19 @@ void VIOManager::updateState(cv::Mat img, int level)
           z(i * patch_size_total + x * patch_size + y) = res;
 
           patch_error += res * res;
-          n_meas += 1;
-          
+          patch_n_meas += 1;
+
           if (exposure_estimate_en) { H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt, cur_value; }
           else { H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt; }
         }
       }
       visual_submap->errors[i] = patch_error;
-      error += patch_error;
+      error_i[i] = patch_error;
+      n_meas_i[i] = patch_n_meas;
     }
+
+    // Serial, index-ordered reduction: same summation order every run.
+    for (int i = 0; i < total_points; i++) { error += error_i[i]; n_meas += n_meas_i[i]; }
 
     error = error / n_meas;
     
@@ -1804,6 +1849,28 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   double t1 = omp_get_wtime();
 
   retrieveFromVisualSparseMap(img, pg, feat_map);
+
+  if (flivo_trace::on())
+  {
+    // Hash the retrieved visual submap: point positions (order-sensitive),
+    // reference patches and per-point exposure. If this already differs the
+    // divergence is in retrieval; if not, it is in the EKF update below.
+    uint64_t hp = 1469598103934665603ULL, hw = 1469598103934665603ULL;
+    for (size_t i = 0; i < visual_submap->voxel_points.size(); i++)
+    {
+      VisualPoint *vp = visual_submap->voxel_points[i];
+      if (vp) { double v[3] = {vp->pos_[0], vp->pos_[1], vp->pos_[2]}; hp = flivo_trace::hashBytes(v, sizeof(v), hp); }
+      if (i < visual_submap->warp_patch.size() && !visual_submap->warp_patch[i].empty())
+        hw = flivo_trace::hashBytes(visual_submap->warp_patch[i].data(),
+                                    visual_submap->warp_patch[i].size() * sizeof(float), hw);
+      if (i < visual_submap->inv_expo_list.size())
+        hw = flivo_trace::hashBytes(&visual_submap->inv_expo_list[i], sizeof(double), hw);
+      if (i < visual_submap->search_levels.size())
+        hw = flivo_trace::hashBytes(&visual_submap->search_levels[i], sizeof(int), hw);
+    }
+    flivo_trace::raw("vio_retrieve", -2, (int)visual_submap->voxel_points.size(), 0, 0, hp);
+    flivo_trace::raw("vio_patches", -2, (int)visual_submap->warp_patch.size(), 0, 0, hw);
+  }
 
   double t2 = omp_get_wtime();
 
