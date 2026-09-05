@@ -83,6 +83,11 @@ public:
 class VIOManager
 {
 public:
+  // Coarsest step getBestSearchLevel() may return. It enters the patch scale as
+  // `1 << (level + search_level)`, so the admission border must be sized with
+  // it; passing it to every getBestSearchLevel() call keeps the two in sync.
+  static constexpr int kMaxSearchLevel = 2;
+
   int grid_size;
   vk::AbstractCamera *cam;
   vk::PinholeCamera *pinhole_cam;

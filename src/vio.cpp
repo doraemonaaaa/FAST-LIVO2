@@ -155,7 +155,15 @@ void VIOManager::initializeVIO()
   patch_size_half = static_cast<int>(patch_size / 2);
   patch_buffer.resize(patch_size_total);
   warp_len = patch_size_total * patch_pyrimid_level;
-  border = (patch_size_half + 1) * (1 << patch_pyrimid_level);
+  // updateState() reads a patch_size box around the point plus a 2*scale
+  // gradient stencil, i.e. (patch_size_half + 1) * scale in every direction,
+  // with scale = 1 << (level + search_level). level peaks at
+  // patch_pyrimid_level - 1 and search_level at kMaxSearchLevel, so the widest
+  // reach is (patch_size_half + 1) << (patch_pyrimid_level - 1 +
+  // kMaxSearchLevel). The original `1 << patch_pyrimid_level` assumed a maximum
+  // search level of 1 and admitted points half that distance from the edge,
+  // whose patches then read outside the image.
+  border = (patch_size_half + 1) * (1 << (patch_pyrimid_level - 1 + kMaxSearchLevel));
 
   retrieve_voxel_points.reserve(length);
   append_voxel_points.reserve(length);
@@ -715,7 +723,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
         getWarpMatrixAffineHomography(*cam, ref_ftr->px_, pf, norm_vec, T_cur_ref, 0, A_cur_ref_zero);
 
-        search_level = getBestSearchLevel(A_cur_ref_zero, 2);
+        search_level = getBestSearchLevel(A_cur_ref_zero, kMaxSearchLevel);
       }
       else
       {
@@ -730,7 +738,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
           getWarpMatrixAffine(*cam, ref_ftr->px_, ref_ftr->f_, (ref_ftr->pos() - pt->pos_).norm(), new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse(),
                               ref_ftr->level_, 0, patch_size_half, A_cur_ref_zero);
 
-          search_level = getBestSearchLevel(A_cur_ref_zero, 2);
+          search_level = getBestSearchLevel(A_cur_ref_zero, kMaxSearchLevel);
 
           Warp *ot = new Warp(search_level, A_cur_ref_zero);
           warp_map[ref_ftr->id_] = ot;
@@ -1157,7 +1165,7 @@ void VIOManager::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, Vo
       getWarpMatrixAffineHomography(*cam, ref_ftr->px_, pf, norm_vec, T_cur_ref, 0, A_cur_ref);
 
       // const Matrix2f A_ref_cur = A_cur_ref.inverse().cast<float>();
-      int search_level = getBestSearchLevel(A_cur_ref.inverse(), 2);
+      int search_level = getBestSearchLevel(A_cur_ref.inverse(), kMaxSearchLevel);
 
       double D = A_cur_ref.determinant();
       if (D > 3) continue;
@@ -1284,7 +1292,7 @@ void VIOManager::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, Vo
     Matrix2d A_cur_ref;
     getWarpMatrixAffine(*cam, ref_ftr->px_, ref_ftr->f_, (ref_ftr->pos() - pt->pos_).norm(), new_frame_->T_f_w_ * ref_ftr->T_f_w_.inverse(), 0, 0,
                         patch_size_half, A_cur_ref);
-    int search_level = getBestSearchLevel(A_cur_ref.inverse(), 2);
+    int search_level = getBestSearchLevel(A_cur_ref.inverse(), kMaxSearchLevel);
     double D = A_cur_ref.determinant();
     if (D > 3) continue;
 
@@ -1607,19 +1615,17 @@ void VIOManager::updateState(cv::Mat img, int level)
       float w_ref_br = subpix_u_ref * subpix_v_ref;
 
       {
-        // The patch loop below indexes img.data with raw pointer arithmetic.
-        // Admission used border = (patch_size_half+1) << patch_pyrimid_level,
-        // but the reach here is patch_size_half*scale plus a 2*scale gradient
-        // stencil, and scale = 1 << (level + search_level) can exceed that, so
-        // points 80-192 px from the edge read outside the buffer. Those reads
-        // return unrelated heap bytes, which differ run to run and flip the
-        // `error <= last_error` accept/reject test below. Skip such points.
-        const long W = width, H = height;
-        long base = (long)(v_ref_i - patch_size_half * scale) * W + (u_ref_i - patch_size_half * scale);
-        long lo = base - (long)scale * W - scale;
-        long hi = base + (long)(patch_size - 1) * scale * W + (long)(patch_size - 1) * scale
-                  + 2L * scale * W + 2L * scale;
-        if (lo < 0 || hi >= W * H)
+        // Defence in depth for the reach `border` is sized from in
+        // initializeVIO(). The loop below walks img.data by raw pointer
+        // arithmetic over (patch_size_half + 1) * scale pixels in every
+        // direction, so a point admitted with too small a border reads outside
+        // the image, or wraps into the neighbouring row. Those bytes are
+        // unrelated heap contents that differ run to run and flip the
+        // `error <= last_error` accept/reject test below. With the corrected
+        // border this never triggers; flivo_oob_count is the assertion.
+        const int reach = (patch_size_half + 1) * scale;
+        if (u_ref_i - reach < 0 || u_ref_i + reach >= width ||
+            v_ref_i - reach < 0 || v_ref_i + reach >= height)
         {
           #pragma omp atomic
           flivo_oob_count++;
