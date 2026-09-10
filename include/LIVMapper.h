@@ -84,7 +84,7 @@ public:
   double _first_lidar_time = 0.0;
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 
-  bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
+  bool lidar_map_inited = false, pcd_save_en = false, pcd_save_native_body_rgb_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
   int img_save_interval = 1, pcd_save_interval = -1, pcd_save_type = 0;
   int pub_scan_num = 1;
 
@@ -135,7 +135,9 @@ public:
   PointCloudXYZI::Ptr feats_down_body;
   PointCloudXYZI::Ptr feats_down_world;
   PointCloudXYZI::Ptr pcl_w_wait_pub;
+  PointCloudXYZI::Ptr pcl_b_wait_pub;
   PointCloudXYZI::Ptr pcl_wait_pub;
+  PointCloudXYZI::Ptr pcl_b_wait_color;
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
 

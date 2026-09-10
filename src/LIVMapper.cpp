@@ -101,7 +101,9 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   feats_down_body.reset(new PointCloudXYZI());
   feats_down_world.reset(new PointCloudXYZI());
   pcl_w_wait_pub.reset(new PointCloudXYZI());
+  pcl_b_wait_pub.reset(new PointCloudXYZI());
   pcl_wait_pub.reset(new PointCloudXYZI());
+  pcl_b_wait_color.reset(new PointCloudXYZI());
   pcl_wait_save.reset(new PointCloudXYZRGB());
   pcl_wait_save_intensity.reset(new PointCloudXYZI());
   voxelmap_manager.reset(new VoxelMapManager(voxel_config, voxel_map));
@@ -163,6 +165,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
 
   nh.param<int>("pcd_save/interval", pcd_save_interval, -1);
   nh.param<bool>("pcd_save/pcd_save_en", pcd_save_en, false);
+  nh.param<bool>("pcd_save/native_body_rgb_en", pcd_save_native_body_rgb_en, false);
   nh.param<int>("pcd_save/type", pcd_save_type, 0);
   nh.param<bool>("image_save/img_save_en", img_save_en, false);
   nh.param<int>("image_save/interval", img_save_interval, 1);
@@ -505,12 +508,15 @@ void LIVMapper::handleLIO()
   PointCloudXYZI::Ptr laserCloudFullRes(dense_map_en ? feats_undistort : feats_down_body);
   int size = laserCloudFullRes->points.size();
   PointCloudXYZI::Ptr laserCloudWorld(new PointCloudXYZI(size, 1));
+  PointCloudXYZI::Ptr laserCloudBody(new PointCloudXYZI(size, 1));
 
   for (int i = 0; i < size; i++) 
   {
     RGBpointBodyToWorld(&laserCloudFullRes->points[i], &laserCloudWorld->points[i]);
+    RGBpointBodyLidarToIMU(&laserCloudFullRes->points[i], &laserCloudBody->points[i]);
   }
   *pcl_w_wait_pub = *laserCloudWorld;
+  *pcl_b_wait_pub = *laserCloudBody;
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if (pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
@@ -1213,17 +1219,26 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 {
   if (pcl_w_wait_pub->empty()) return;
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
+  PointCloudXYZRGB::Ptr laserCloudBodyRGB(new PointCloudXYZRGB());
   static int pub_num = 1;
   pub_num++;
 
   if (LidarMeasures.lio_vio_flg == VIO)
   {
     *pcl_wait_pub += *pcl_w_wait_pub;
+    *pcl_b_wait_color += *pcl_b_wait_pub;
     if(pub_num >= pub_scan_num)
     {
       pub_num = 1;
       size_t size = pcl_wait_pub->points.size();
+      if (pcl_b_wait_color->points.size() != size)
+      {
+        ROS_ERROR("native body RGB correspondence size mismatch: world=%zu body=%zu",
+                  size, pcl_b_wait_color->points.size());
+        size = std::min(size, pcl_b_wait_color->points.size());
+      }
       laserCloudWorldRGB->reserve(size);
+      laserCloudBodyRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
       cv::Mat img_rgb = vio_manager->img_rgb;
       for (size_t i = 0; i < size; i++)
@@ -1247,7 +1262,18 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
           // if (pointRGB.r > 255) pointRGB.r = 255; else if (pointRGB.r < 0) pointRGB.r = 0;
           // if (pointRGB.g > 255) pointRGB.g = 255; else if (pointRGB.g < 0) pointRGB.g = 0;
           // if (pointRGB.b > 255) pointRGB.b = 255; else if (pointRGB.b < 0) pointRGB.b = 0;
-          if (pf.norm() > blind_rgb_points) laserCloudWorldRGB->push_back(pointRGB);
+          if (pf.norm() > blind_rgb_points)
+          {
+            laserCloudWorldRGB->push_back(pointRGB);
+            PointTypeRGB pointBodyRGB;
+            pointBodyRGB.x = pcl_b_wait_color->points[i].x;
+            pointBodyRGB.y = pcl_b_wait_color->points[i].y;
+            pointBodyRGB.z = pcl_b_wait_color->points[i].z;
+            pointBodyRGB.r = pointRGB.r;
+            pointBodyRGB.g = pointRGB.g;
+            pointBodyRGB.b = pointRGB.b;
+            laserCloudBodyRGB->push_back(pointBodyRGB);
+          }
         }
       }
     }
@@ -1266,6 +1292,18 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   laserCloudmsg.header.stamp = ros::Time::now(); //.fromSec(last_timestamp_lidar);
   laserCloudmsg.header.frame_id = "camera_init";
   pubLaserCloudFullRes.publish(laserCloudmsg);
+
+  // Preserve FAST-LIVO2's native camera colouring in the IMU/body frame.
+  // Geometry consumers keep using pcd_save/type=1; this sidecar lets every
+  // downstream trajectory render exactly the same native points and colours.
+  if (pcd_save_en && pcd_save_native_body_rgb_en
+      && LidarMeasures.lio_vio_flg == VIO && !laserCloudBodyRGB->empty())
+  {
+    std::stringstream rgb_time;
+    rgb_time << std::fixed << std::setprecision(6) << LidarMeasures.last_lio_update_time;
+    const std::string rgb_path = std::string(ROOT_DIR) + "Log/pcd_rgb/" + rgb_time.str() + ".pcd";
+    pcl::PCDWriter().writeBinary(rgb_path, *laserCloudBodyRGB);
+  }
 
   /**************** save map ****************/
   /* 1. make sure you have enough memories
@@ -1300,13 +1338,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       case 1: /** body frame **/
         if (LidarMeasures.lio_vio_flg == LIO || LidarMeasures.lio_vio_flg == LO)
         {
-          int size = feats_undistort->points.size();
-          PointCloudXYZI::Ptr laserCloudBody(new PointCloudXYZI(size, 1));
-          for (int i = 0; i < size; i++)
-          {
-            RGBpointBodyLidarToIMU(&feats_undistort->points[i], &laserCloudBody->points[i]);
-          }
-          *pcl_wait_save_intensity += *laserCloudBody;
+          *pcl_wait_save_intensity += *pcl_b_wait_pub;
           scan_wait_num++;
           cout << "save body frame points: " << pcl_wait_save_intensity->points.size() << endl;
         }
@@ -1364,8 +1396,16 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
     }
   }
 
-  if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
-  if(LidarMeasures.lio_vio_flg == VIO)  PointCloudXYZI().swap(*pcl_w_wait_pub);
+  if(laserCloudWorldRGB->size() > 0)
+  {
+    PointCloudXYZI().swap(*pcl_wait_pub);
+    PointCloudXYZI().swap(*pcl_b_wait_color);
+  }
+  if(LidarMeasures.lio_vio_flg == VIO)
+  {
+    PointCloudXYZI().swap(*pcl_w_wait_pub);
+    PointCloudXYZI().swap(*pcl_b_wait_pub);
+  }
 }
 
 void LIVMapper::publish_visual_sub_map(const ros::Publisher &pubSubVisualMap)
