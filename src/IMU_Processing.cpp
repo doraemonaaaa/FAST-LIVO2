@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "IMU_Processing.h"
+#include <stdexcept>
 
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
                            Zero3d(0, 0, 0), b_first_frame(true), imu_need_init(true)
@@ -101,6 +102,18 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
 void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num; }
 
+void ImuProcess::set_orientation_initialization(double acceleration_norm, double velocity_sigma, double gravity_sigma)
+{
+  if (!std::isfinite(acceleration_norm) || acceleration_norm <= 0 ||
+      !std::isfinite(velocity_sigma) || velocity_sigma <= 0 ||
+      !std::isfinite(gravity_sigma) || gravity_sigma <= 0)
+    throw std::runtime_error("imu_orientation initialization requires positive finite norm and sigmas");
+  orientation_initialization = true;
+  initialization_acceleration_norm = acceleration_norm;
+  initialization_velocity_sigma = velocity_sigma;
+  initialization_gravity_sigma = gravity_sigma;
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -144,6 +157,23 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   state_inout.bias_g = Zero3d; // mean_gyr;
+
+  if (orientation_initialization)
+  {
+    // Message orientation must rotate the published IMU vector frame into a
+    // Z-up navigation frame. Only tilt is used; local yaw remains arbitrary.
+    const auto &msg = meas.imu.back();
+    const auto &q = msg->orientation;
+    Eigen::Quaterniond attitude(q.w, q.x, q.y, q.z);
+    if (msg->orientation_covariance[0] < 0 || !attitude.coeffs().allFinite() ||
+        std::abs(attitude.norm() - 1.0) > 0.01)
+      throw std::runtime_error("imu_orientation initialization: missing/invalid IMU attitude");
+    state_inout.gravity = attitude.normalized().conjugate() * V3D(0, 0, -G_m_s2);
+    IMU_mean_acc_norm = initialization_acceleration_norm;
+    // A zero mean is an initial guess, not a zero-velocity observation.
+    state_inout.cov.block<3, 3>(7, 7) = Eye3d * initialization_velocity_sigma * initialization_velocity_sigma;
+    state_inout.cov.block<3, 3>(16, 16) = Eye3d * initialization_gravity_sigma * initialization_gravity_sigma;
+  }
 
   last_imu = meas.imu.back();
 }
@@ -350,7 +380,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // imu_time = head->header.stamp.toSec() - first_lidar_time;
 
       angvel_avr -= state_inout.bias_g;
-      acc_avr = acc_avr * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
+      acc_avr = acc_avr * G_m_s2 / IMU_mean_acc_norm - state_inout.bias_a;
 
       if (head->header.stamp.toSec() < prop_beg_time)
       {
@@ -570,6 +600,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     {
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
+      if (orientation_initialization)
+        ROS_INFO("Initialization mode: imu_orientation; acceleration reference norm %.6f; velocity sigma %.3f m/s; gravity sigma %.3f m/s2",
+                 IMU_mean_acc_norm, initialization_velocity_sigma, initialization_gravity_sigma);
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],

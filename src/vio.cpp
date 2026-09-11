@@ -30,6 +30,22 @@ VIOManager::~VIOManager()
   feat_map.clear();
 }
 
+void VIOManager::clearStartupMap()
+{
+  // Drop borrowed references before destroying the owning voxel containers.
+  visual_submap->reset();
+  retrieve_voxel_points.clear();
+  append_voxel_points.clear();
+  sub_feat_map.clear();
+  for (auto &item : warp_map) delete item.second;
+  warp_map.clear();
+  for (auto &item : feat_map) delete item.second;
+  feat_map.clear();
+  has_ref_patch_cache = false;
+  total_points = 0;
+  resetGrid();
+}
+
 void VIOManager::setImuToLidarExtrinsic(const V3D &transl, const M3D &rot)
 {
   Pli = -rot.transpose() * transl;

@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
+#include "startup_map_gate.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
@@ -29,6 +30,9 @@ public:
   void initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it);
   void initializeComponents();
   void initializeFiles();
+  void updateStartupMapGate();
+  StartupMapGate startup_map_gate;
+  std::ofstream startup_gate_log;
   void run();
   void gravityAlignment();
   void handleFirstFrame();
