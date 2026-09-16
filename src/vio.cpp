@@ -1571,9 +1571,16 @@ void VIOManager::updateState(cv::Mat img, int level)
   // in index order — deterministic, and bit-identical to a single-threaded run.
   vector<float> error_i(total_points, 0.0f);
   vector<int> n_meas_i(total_points, 0);
+  G.setZero();
 
   for (int iteration = 0; iteration < max_iterations; iteration++)
   {
+    // Reprojection changes at every iteration. A patch that was valid in the
+    // previous iteration may now be skipped by the image-boundary check below.
+    // Its old rows must not survive into H^T H / H^T z while being excluded
+    // from the current photometric error and measurement count.
+    H_sub.setZero();
+    z.setZero();
     double t1 = omp_get_wtime();
 
     M3D Rwi(state->rot_end);
@@ -1700,6 +1707,13 @@ void VIOManager::updateState(cv::Mat img, int level)
     // Serial, index-ordered reduction: same summation order every run.
     for (int i = 0; i < total_points; i++) { error += error_i[i]; n_meas += n_meas_i[i]; }
 
+    if (n_meas == 0)
+    {
+      // No current observation can validate the trial state. Restore the last
+      // accepted state; G is zero if there has not been an accepted iteration.
+      (*state) = old_state;
+      break;
+    }
     error = error / n_meas;
     
     compute_jacobian_time += omp_get_wtime() - t1;
