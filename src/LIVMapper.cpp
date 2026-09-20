@@ -1,3 +1,4 @@
+#include "point_timestamp.h"
 /* 
 This file is part of FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry.
 
@@ -143,6 +144,24 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<double>("time_offset/img_time_offset", img_time_offset, 0.0);
   nh.param<double>("time_offset/imu_time_offset", imu_time_offset, 0.0);
   nh.param<double>("time_offset/lidar_time_offset", lidar_time_offset, 0.0);
+  nh.param<std::string>("time_offset/lidar_timestamp_source", lidar_timestamp_source, "header");
+  nh.param<double>("time_offset/lidar_clock_offset", lidar_clock_offset, 0.0);
+  nh.param<double>("time_offset/lidar_max_scan_duration", lidar_max_scan_duration, 0.2);
+  if (lidar_timestamp_source != "header" && lidar_timestamp_source != "point_timestamp")
+    throw std::runtime_error("lidar_timestamp_source must be header or point_timestamp");
+  if (lidar_timestamp_source == "point_timestamp") {
+    int type; nh.param<int>("preprocess/lidar_type", type, 1);
+    if (type != XT32 && type != PANDAR128 && type != ROBOSENSE)
+      throw std::runtime_error("point_timestamp supports XT32, PANDAR128 and ROBOSENSE absolute timestamps only");
+    bool features; nh.param<bool>("preprocess/feature_extract_enabled", features, false);
+    if (type == XT32 && features)
+      throw std::runtime_error("point_timestamp requires XT32 feature extraction disabled");
+    if (!std::isfinite(lidar_clock_offset) || !std::isfinite(lidar_max_scan_duration) || lidar_max_scan_duration <= 0)
+      throw std::runtime_error("invalid point timestamp configuration");
+    ROS_INFO("LiDAR timing: native point timestamps, clock offset %.9f s; header offset %.9f s is ignored",
+             lidar_clock_offset, lidar_time_offset);
+  }
+
   nh.param<bool>("uav/imu_rate_odom", imu_prop_enable, false);
   nh.param<bool>("uav/gravity_align_en", gravity_align_en, false);
 
@@ -870,9 +889,20 @@ void LIVMapper::RGBpointBodyLidarToIMU(PointType const *const pi, PointType *con
 void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
 {
   if (!lidar_en) return;
-  mtx_buffer.lock();
-
   double cur_head_time = msg->header.stamp.toSec() + lidar_time_offset;
+  if (lidar_timestamp_source == "point_timestamp") {
+    try {
+      cur_head_time = point_time::anchor(point_time::bounds(*msg, lidar_max_scan_duration), lidar_clock_offset);
+    } catch (const std::exception& error) {
+      ROS_ERROR_STREAM("Dropping LiDAR scan: " << error.what());
+      return;
+    }
+    if (last_timestamp_lidar >= 0 && cur_head_time <= last_timestamp_lidar) {
+      ROS_ERROR_STREAM("Dropping non-increasing LiDAR point timestamp: " << std::setprecision(16) << cur_head_time);
+      return;
+    }
+  }
+  mtx_buffer.lock();
   // cout<<"got feature"<<endl;
   if (cur_head_time < last_timestamp_lidar)
   {
@@ -1095,6 +1125,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 
+    if (lidar_timestamp_source == "point_timestamp") {
+      // Deskew offsets are relative to the previous propagation endpoint,
+      // not this scan's start. Scan gaps need to be included exactly once.
+      for (auto& point : meas.pcl_proc_cur->points)
+        point.curvature = point_time::rebased_ms(point.curvature, meas.lidar_frame_beg_time, meas.last_lio_update_time);
+    }
     meas.lio_vio_flg = LIO; // process lidar topic, so timestamp should be lidar scan end.
     meas.measures.push_back(m);
     // ROS_INFO("ONlY HAS LiDAR and IMU, NO IMAGE!");

@@ -102,6 +102,8 @@ public:
   ros::Publisher pubImuPropOdom;
   double imu_time_offset = 0.0;
   double lidar_time_offset = 0.0;
+  std::string lidar_timestamp_source = "header";
+  double lidar_clock_offset = 0.0, lidar_max_scan_duration = 0.2;
 
   bool gravity_align_en = false, gravity_align_finished = false;
 
