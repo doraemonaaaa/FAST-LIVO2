@@ -12,6 +12,16 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+namespace
+{
+VOXEL_LOCATION voxelLocation(const V3D &point, double voxel_size)
+{
+  return VOXEL_LOCATION(static_cast<int64_t>(std::floor(point.x() / voxel_size)),
+                        static_cast<int64_t>(std::floor(point.y() / voxel_size)),
+                        static_cast<int64_t>(std::floor(point.z() / voxel_size)));
+}
+} // namespace
+
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
@@ -531,7 +541,7 @@ void VoxelMapManager::TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vec
 
 void VoxelMapManager::BuildVoxelMap()
 {
-  float voxel_size = config_setting_.max_voxel_size_;
+  const double voxel_size = config_setting_.max_voxel_size_;
   float planer_threshold = config_setting_.planner_threshold_;
   int max_layer = config_setting_.max_layer_;
   int max_points_num = config_setting_.max_points_num_;
@@ -558,13 +568,7 @@ void VoxelMapManager::BuildVoxelMap()
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_v.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    const VOXEL_LOCATION position = voxelLocation(p_v.point_w, voxel_size);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
@@ -608,7 +612,7 @@ V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
 
 void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_points)
 {
-  float voxel_size = config_setting_.max_voxel_size_;
+  const double voxel_size = config_setting_.max_voxel_size_;
   float planer_threshold = config_setting_.planner_threshold_;
   int max_layer = config_setting_.max_layer_;
   int max_points_num = config_setting_.max_points_num_;
@@ -617,13 +621,7 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_v.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    const VOXEL_LOCATION position = voxelLocation(p_v.point_w, voxel_size);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
     else
@@ -662,46 +660,47 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   for (int i = 0; i < index.size(); i++)
   {
     pointWithVar &pv = pv_list[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = pv.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    const VOXEL_LOCATION position = voxelLocation(pv.point_w, voxel_size);
+    PointToPlane single_ptpl;
+    bool is_sucess = false;
+    double prob = 0;
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
-      VoxelOctoTree *current_octo = iter->second;
-      PointToPlane single_ptpl;
-      bool is_sucess = false;
-      double prob = 0;
-      build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
-      if (!is_sucess)
+      build_single_residual(pv, iter->second, 0, is_sucess, prob, single_ptpl);
+    }
+    if (!is_sucess)
+    {
+      // Work in dimensionless cell coordinates throughout. Near a boundary,
+      // search every combination of the adjacent faces (up to seven cells),
+      // including when the current cell is absent. The middle half of a cell
+      // does not extend the search along that axis, matching the old margin.
+      const int64_t cell[3] = {position.x, position.y, position.z};
+      int direction[3];
+      for (int axis = 0; axis < 3; ++axis)
       {
-        VOXEL_LOCATION near_position = position;
-        if (loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
-        else if (loc_xyz[0] < (current_octo->voxel_center_[0] - current_octo->quater_length_)) { near_position.x = near_position.x - 1; }
-        if (loc_xyz[1] > (current_octo->voxel_center_[1] + current_octo->quater_length_)) { near_position.y = near_position.y + 1; }
-        else if (loc_xyz[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_)) { near_position.y = near_position.y - 1; }
-        if (loc_xyz[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
-        else if (loc_xyz[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
-        auto iter_near = voxel_map_.find(near_position);
-        if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, prob, single_ptpl); }
+        const double fraction = pv.point_w[axis] / voxel_size - cell[axis];
+        direction[axis] = fraction < 0.25 ? -1 : (fraction > 0.75 ? 1 : 0);
       }
-      if (is_sucess)
-      {
-        mylock.lock();
-        useful_ptpl[i] = true;
-        all_ptpl_list[i] = single_ptpl;
-        mylock.unlock();
-      }
-      else
-      {
-        mylock.lock();
-        useful_ptpl[i] = false;
-        mylock.unlock();
-      }
+      for (int x = 0; x <= (direction[0] != 0); ++x)
+        for (int y = 0; y <= (direction[1] != 0); ++y)
+          for (int z = 0; z <= (direction[2] != 0); ++z)
+          {
+            if (x == 0 && y == 0 && z == 0) continue;
+            const VOXEL_LOCATION neighbor(position.x + x * direction[0],
+                                          position.y + y * direction[1],
+                                          position.z + z * direction[2]);
+            auto nearby = voxel_map_.find(neighbor);
+            if (nearby != voxel_map_.end())
+              build_single_residual(pv, nearby->second, 0, is_sucess, prob, single_ptpl);
+          }
+    }
+    if (is_sucess)
+    {
+      mylock.lock();
+      useful_ptpl[i] = true;
+      all_ptpl_list[i] = single_ptpl;
+      mylock.unlock();
     }
   }
   for (size_t i = 0; i < useful_ptpl.size(); i++)
@@ -932,16 +931,10 @@ void VoxelMapManager::mapSliding()
   //get global id now
   last_slide_position = position_last_;
   double t_sliding_start = omp_get_wtime();
-  float loc_xyz[3];
-  for (int j = 0; j < 3; j++)
-  {
-    loc_xyz[j] = position_last_[j] / config_setting_.max_voxel_size_;
-    if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-  }
-  // VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);//discrete global
-  clearMemOutOfMap((int64_t)loc_xyz[0] + config_setting_.half_map_size, (int64_t)loc_xyz[0] - config_setting_.half_map_size,
-                    (int64_t)loc_xyz[1] + config_setting_.half_map_size, (int64_t)loc_xyz[1] - config_setting_.half_map_size,
-                    (int64_t)loc_xyz[2] + config_setting_.half_map_size, (int64_t)loc_xyz[2] - config_setting_.half_map_size);
+  const VOXEL_LOCATION position = voxelLocation(position_last_, config_setting_.max_voxel_size_);
+  clearMemOutOfMap(position.x + config_setting_.half_map_size, position.x - config_setting_.half_map_size,
+                   position.y + config_setting_.half_map_size, position.y - config_setting_.half_map_size,
+                   position.z + config_setting_.half_map_size, position.z - config_setting_.half_map_size);
   double t_sliding_end = omp_get_wtime();
   std::cout<<RED<<"[DEBUG]: Map sliding using "<<t_sliding_end - t_sliding_start<<" secs"<<RESET<<"\n";
   return;
