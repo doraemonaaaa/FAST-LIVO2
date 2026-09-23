@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "vio.h"
+#include "camera_projection.h"
 #include "flivo_trace.h"
 
 static long flivo_oob_count = 0;   // patches whose reads fall outside the image
@@ -214,18 +215,9 @@ void VIOManager::resetGrid()
   // sample_points.clear();
 // }
 
-void VIOManager::computeProjectionJacobian(V3D p, MD(2, 3) & J)
+bool VIOManager::computeProjectionJacobian(V3D p, MD(2, 3) & J)
 {
-  const double x = p[0];
-  const double y = p[1];
-  const double z_inv = 1. / p[2];
-  const double z_inv_2 = z_inv * z_inv;
-  J(0, 0) = fx * z_inv;
-  J(0, 1) = 0.0;
-  J(0, 2) = -fx * x * z_inv_2;
-  J(1, 0) = 0.0;
-  J(1, 1) = fy * z_inv;
-  J(1, 2) = -fy * y * z_inv_2;
+  return flivo::projectionJacobian(*cam, p, J);
 }
 
 void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
@@ -1374,16 +1366,15 @@ void VIOManager::precomputeReferencePatches(int level)
     const int scale = (1 << level);
 
     VisualPoint *pt = visual_submap->voxel_points[i];
+    if (pt == nullptr || pt->ref_patch == nullptr) continue;
     cv::Mat img = pt->ref_patch->img_;
-
-    if (pt == nullptr) continue;
 
     double depth((pt->pos_ - pt->ref_patch->pos()).norm());
     V3D pf = pt->ref_patch->f_ * depth;
     V2D pc = pt->ref_patch->px_;
     M3D R_ref_w = pt->ref_patch->T_f_w_.rotation_matrix();
 
-    computeProjectionJacobian(pf, Jdpi);
+    if (!computeProjectionJacobian(pf, Jdpi)) continue;
     p_w_hat << SKEW_SYM_MATRX(pt->pos_);
 
     const float u_ref = pc[0];
@@ -1451,6 +1442,8 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
 
   for (int iteration = 0; iteration < max_iterations; iteration++)
   {
+    H_sub.setZero();
+    z.setZero();
     double t1 = omp_get_wtime();
     double count_outlier = 0;
     if (has_ref_patch_cache == false) precomputeReferencePatches(level);
@@ -1475,12 +1468,18 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       if (pt == nullptr) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (!flivo::validProjectionRay(pf) ||
+          H_sub_inv.middleRows(i * patch_size_total, patch_size_total).isZero(0)) continue;
       pc = cam->world2cam(pf);
+      if (!pc.allFinite()) continue;
 
       const float u_ref = pc[0];
       const float v_ref = pc[1];
       const int u_ref_i = floorf(pc[0] / scale) * scale;
       const int v_ref_i = floorf(pc[1] / scale) * scale;
+      const int reach = (patch_size_half + 1) * scale;
+      if (u_ref_i - reach < 0 || u_ref_i + reach >= width ||
+          v_ref_i - reach < 0 || v_ref_i + reach >= height) continue;
       const float subpix_u_ref = (u_ref - u_ref_i) / scale;
       const float subpix_v_ref = (v_ref - v_ref_i) / scale;
       const float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
@@ -1510,6 +1509,11 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       error += patch_error;
     }
 
+    if (n_meas == 0)
+    {
+      (*state) = old_state;
+      break;
+    }
     error = error / n_meas;
 
     compute_jacobian_time += omp_get_wtime() - t1;
@@ -1620,9 +1624,9 @@ void VIOManager::updateState(cv::Mat img, int level)
       if (pt == nullptr) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (!computeProjectionJacobian(pf, Jdpi)) continue;
       V2D pc = cam->world2cam(pf);
-
-      computeProjectionJacobian(pf, Jdpi);
+      if (!pc.allFinite()) continue;
       M3D p_hat;
       p_hat << SKEW_SYM_MATRX(pf);
 

@@ -154,7 +154,7 @@ public:
   void setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P);
   void initializeVIO();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
-  void computeProjectionJacobian(V3D p, MD(2, 3) & J);
+  bool computeProjectionJacobian(V3D p, MD(2, 3) & J);
   void computeJacobianAndUpdateEKF(cv::Mat img);
   void resetGrid();
   void clearStartupMap();
