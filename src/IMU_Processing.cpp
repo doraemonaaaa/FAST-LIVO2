@@ -12,6 +12,7 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 #include <stdexcept>
+#include "motion_initializer.h"
 
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
                            Zero3d(0, 0, 0), b_first_frame(true), imu_need_init(true)
@@ -114,6 +115,12 @@ void ImuProcess::set_orientation_initialization(double acceleration_norm, double
   initialization_gravity_sigma = gravity_sigma;
 }
 
+void ImuProcess::enable_motion_initialization()
+{
+  if (!orientation_initialization) throw std::runtime_error("motion initialization requires IMU attitude");
+  motion_initializer.reset(new MotionInitializer());
+}
+
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
@@ -156,7 +163,9 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   IMU_mean_acc_norm = mean_acc.norm();
   state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
-  state_inout.bias_g = Zero3d; // mean_gyr;
+  // Static initialization observes gyro bias directly. Orientation-based
+  // initialization may happen in motion, so its mean is not a bias estimate.
+  state_inout.bias_g = orientation_initialization ? Zero3d : mean_gyr;
 
   if (orientation_initialization)
   {
@@ -588,6 +597,7 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     double pcl_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
     // lidar_meas.last_lio_update_time = pcl_end_time;
 
+    cur_pcl_un_->clear();
     if (meas.imu.empty()) { return; };
     /// The very first lidar frame
     IMU_init(meas, stat, init_iter_num);
@@ -596,7 +606,32 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
 
     last_imu = meas.imu.back();
 
-    if (init_iter_num > MAX_INI_COUNT)
+    bool motion_ready = !motion_initializer;
+    if (motion_initializer && lidar_meas.lio_vio_flg == LIO)
+    {
+      auto r = motion_initializer->update(*lidar_meas.pcl_proc_cur,
+          lidar_meas.last_lio_update_time, meas.lio_time, meas.imu,
+          Lid_rot_to_IMU, Lid_offset_to_IMU);
+      // Advance the slicing origin while startup scans are withheld from mapping.
+      lidar_meas.last_lio_update_time = meas.lio_time;
+      ROS_INFO("[motion init] t=%.3f ratio=%.3f residual=%.4f eigen=%.5f fit=%.4f ready=%d",
+          r.elapsed,r.match_ratio,r.residual,r.eigen_ratio,r.fit_error,int(r.ready));
+      motion_ready = r.ready;
+      if (r.ready)
+      {
+        stat.pos_end = r.position; stat.rot_end = r.rotation;
+        stat.vel_end = r.velocity; stat.gravity = r.gravity;
+        stat.cov.block<3,3>(7,7) = r.velocity_cov;
+        last_prop_end_time = meas.lio_time;
+        acc_s_last = stat.rot_end * V3D(last_imu->linear_acceleration.x,
+            last_imu->linear_acceleration.y,last_imu->linear_acceleration.z) + stat.gravity;
+        angvel_last = V3D(last_imu->angular_velocity.x,last_imu->angular_velocity.y,last_imu->angular_velocity.z);
+        ROS_WARN("[motion init] accepted velocity %.6f %.6f %.6f m/s, std %.4f %.4f %.4f",
+          r.velocity.x(),r.velocity.y(),r.velocity.z(),std::sqrt(r.velocity_cov(0,0)),
+          std::sqrt(r.velocity_cov(1,1)),std::sqrt(r.velocity_cov(2,2)));
+      }
+    }
+    if (init_iter_num > MAX_INI_COUNT && motion_ready)
     {
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;

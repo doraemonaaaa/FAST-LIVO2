@@ -22,6 +22,7 @@ which is included as part of this source code package.
 const bool time_list(PointType &x, PointType &y) { return (x.curvature < y.curvature); }
 
 /// *************IMU Process and undistortion
+class MotionInitializer;
 class ImuProcess
 {
 public:
@@ -42,6 +43,7 @@ public:
   void set_inv_expo_cov(const double &inv_expo);
   void set_imu_init_frame_num(const int &num);
   void set_orientation_initialization(double acceleration_norm, double velocity_sigma, double gravity_sigma);
+  void enable_motion_initialization();
   void disable_imu();
   void disable_gravity_est();
   void disable_bias_est();
@@ -86,6 +88,7 @@ private:
   bool gravity_est_en = true;
   bool ba_bg_est_en = true;
   bool exposure_estimate_en = true;
+  std::unique_ptr<MotionInitializer> motion_initializer;
   bool orientation_initialization = false;
   double initialization_acceleration_norm = 0;
   double initialization_velocity_sigma = 0;
