@@ -108,7 +108,7 @@ void ImuProcess::set_orientation_initialization(double acceleration_norm, double
   if (!std::isfinite(acceleration_norm) || acceleration_norm <= 0 ||
       !std::isfinite(velocity_sigma) || velocity_sigma <= 0 ||
       !std::isfinite(gravity_sigma) || gravity_sigma <= 0)
-    throw std::runtime_error("imu_orientation initialization requires positive finite norm and sigmas");
+    throw std::runtime_error("IMU attitude initialization requires positive finite norm and sigmas");
   orientation_initialization = true;
   initialization_acceleration_norm = acceleration_norm;
   initialization_velocity_sigma = velocity_sigma;
@@ -176,7 +176,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     Eigen::Quaterniond attitude(q.w, q.x, q.y, q.z);
     if (msg->orientation_covariance[0] < 0 || !attitude.coeffs().allFinite() ||
         std::abs(attitude.norm() - 1.0) > 0.01)
-      throw std::runtime_error("imu_orientation initialization: missing/invalid IMU attitude");
+      throw std::runtime_error("IMU attitude initialization: missing/invalid IMU attitude");
     state_inout.gravity = attitude.normalized().conjugate() * V3D(0, 0, -G_m_s2);
     IMU_mean_acc_norm = initialization_acceleration_norm;
     // A zero mean is an initial guess, not a zero-velocity observation.
@@ -636,8 +636,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
       if (orientation_initialization)
-        ROS_INFO("Initialization mode: imu_orientation; acceleration reference norm %.6f; velocity sigma %.3f m/s; gravity sigma %.3f m/s2",
-                 IMU_mean_acc_norm, initialization_velocity_sigma, initialization_gravity_sigma);
+        ROS_INFO("Initialization mode: imu_lidar_motion_initialization; acceleration reference norm %.6f; fitted velocity std %.3f %.3f %.3f m/s; gravity sigma %.3f m/s2",
+                 IMU_mean_acc_norm, std::sqrt(stat.cov(7,7)), std::sqrt(stat.cov(8,8)),
+                 std::sqrt(stat.cov(9,9)), initialization_gravity_sigma);
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],

@@ -176,15 +176,15 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   }
   std::string initialization_mode;
   nh.param<std::string>("imu/initialization_mode", initialization_mode, "static_acceleration");
-  if (initialization_mode == "imu_orientation" || initialization_mode == "imu_orientation_motion")
+  if (initialization_mode == "imu_lidar_motion_initialization")
   {
     double acceleration_norm, velocity_sigma, gravity_sigma;
     if (!nh.getParam("imu/initialization_acceleration_norm", acceleration_norm) ||
         !nh.getParam("imu/initialization_velocity_sigma", velocity_sigma) ||
         !nh.getParam("imu/initialization_gravity_sigma", gravity_sigma))
-      throw std::runtime_error("imu_orientation mode requires acceleration_norm, velocity_sigma and gravity_sigma parameters");
+      throw std::runtime_error("imu_lidar_motion_initialization mode requires acceleration_norm, velocity_sigma and gravity_sigma parameters");
     p_imu->set_orientation_initialization(acceleration_norm, velocity_sigma, gravity_sigma);
-    if (initialization_mode == "imu_orientation_motion") p_imu->enable_motion_initialization();
+    p_imu->enable_motion_initialization();
   }
   else if (initialization_mode != "static_acceleration")
     throw std::runtime_error("Unknown imu/initialization_mode: " + initialization_mode);
