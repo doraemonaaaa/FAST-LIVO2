@@ -146,7 +146,7 @@ public:
   VIOManager();
   ~VIOManager();
   void updateStateInverse(cv::Mat img, int level);
-  void updateState(cv::Mat img, int level);
+  void updateState(cv::Mat img, int level, const vector<double> &noise_weights);
   void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);

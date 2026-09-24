@@ -11,8 +11,10 @@
 // Points and inertial increments are expressed in the first scan's IMU frame.
 class MotionInitializer {
 public:
+  explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0)
+      : timeout_fallback_(timeout_fallback), fallback_velocity_sigma_(std::max(1.0, velocity_sigma)) {}
   struct Result {
-    bool ready=false;
+    bool ready=false, timeout_fallback=false;
     V3D velocity=V3D::Zero(), position=V3D::Zero(), gravity=V3D::Zero();
     M3D rotation=M3D::Identity(), velocity_cov=M3D::Identity();
     double elapsed=0, match_ratio=0, residual=0, eigen_ratio=0, fit_error=0;
@@ -44,7 +46,15 @@ public:
     if(first_attempt<0)first_attempt=end;
     if(start<0) { start=end; anchor=q; previous_time=end; previous_acc=V3D::Zero(); }
     out.elapsed=end-start;
-    if(end-first_attempt>10) throw std::runtime_error("motion initialization: no observable consistent velocity within 10 seconds");
+    if(end-first_attempt>10) {
+      if(!timeout_fallback_)
+        throw std::runtime_error("motion initialization: no observable consistent velocity within 10 seconds");
+      // Restart the local frame at the current scan. Do not use unaccepted motion fits.
+      out.ready=true; out.timeout_fallback=true;
+      out.gravity=q.conjugate()*V3D(0,0,-9.81);
+      out.velocity_cov=M3D::Identity()*fallback_velocity_sigma_*fallback_velocity_sigma_;
+      return out;
+    }
     M3D R=(anchor.conjugate()*q).toRotationMatrix();
     V3D gravity=anchor.conjugate()*V3D(0,0,-9.81);
     // Integrate IMU acceleration at its own timestamps; do not use scan-rate acceleration.
@@ -118,6 +128,8 @@ public:
     return out;
   }
 private:
+  bool timeout_fallback_;
+  double fallback_velocity_sigma_;
   void buildNormals() {
     normals.resize(target->size(),V3D::Zero());centers.resize(target->size(),V3D::Zero());
     for(size_t i=0;i<target->size();++i) {

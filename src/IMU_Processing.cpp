@@ -118,7 +118,10 @@ void ImuProcess::set_orientation_initialization(double acceleration_norm, double
 void ImuProcess::enable_motion_initialization()
 {
   if (!orientation_initialization) throw std::runtime_error("motion initialization requires IMU attitude");
-  motion_initializer.reset(new MotionInitializer());
+  bool timeout_fallback=false;
+  ros::NodeHandle nh;
+  nh.param<bool>("imu/motion_initialization_timeout_fallback", timeout_fallback, false);
+  motion_initializer.reset(new MotionInitializer(timeout_fallback, initialization_velocity_sigma));
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
@@ -626,7 +629,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
         acc_s_last = stat.rot_end * V3D(last_imu->linear_acceleration.x,
             last_imu->linear_acceleration.y,last_imu->linear_acceleration.z) + stat.gravity;
         angvel_last = V3D(last_imu->angular_velocity.x,last_imu->angular_velocity.y,last_imu->angular_velocity.z);
-        ROS_WARN("[motion init] accepted velocity %.6f %.6f %.6f m/s, std %.4f %.4f %.4f",
+        if (r.timeout_fallback)
+          ROS_WARN("[motion init] TIMEOUT FALLBACK: current IMU attitude, zero velocity guess, velocity sigma >= 1 m/s; no accepted motion fit");
+        ROS_WARN("[motion init] initial velocity %.6f %.6f %.6f m/s, std %.4f %.4f %.4f",
           r.velocity.x(),r.velocity.y(),r.velocity.z(),std::sqrt(r.velocity_cov(0,0)),
           std::sqrt(r.velocity_cov(1,1)),std::sqrt(r.velocity_cov(2,2)));
       }
@@ -636,7 +641,7 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
       if (orientation_initialization)
-        ROS_INFO("Initialization mode: imu_lidar_motion_initialization; acceleration reference norm %.6f; fitted velocity std %.3f %.3f %.3f m/s; gravity sigma %.3f m/s2",
+        ROS_INFO("Initialization mode: imu_lidar_motion_initialization; acceleration reference norm %.6f; initial velocity std %.3f %.3f %.3f m/s; gravity sigma %.3f m/s2",
                  IMU_mean_acc_norm, std::sqrt(stat.cov(7,7)), std::sqrt(stat.cov(8,8)),
                  std::sqrt(stat.cov(9,9)), initialization_gravity_sigma);
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "

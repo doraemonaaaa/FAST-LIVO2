@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "vio.h"
 #include "camera_projection.h"
+#include "photometric_noise.h"
+#include "patch_score.h"
 #include "flivo_trace.h"
 
 static long flivo_oob_count = 0;   // patches whose reads fall outside the image
@@ -763,11 +765,17 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
       getImagePatch(img, pc, patch_buffer.data(), 0);
 
+      // The forward update uses this same per-frame noise normalization.
+      // The legacy inverse-compositional path uses a separate raw-image cost.
+      const double noise_weight = inverse_composition_en ? 1.0 :
+          flivo::photometricSqrtInformation(state->inv_expo_time, ref_ftr->inv_expo_time_);
+      if (noise_weight == 0.0) continue;
       float error = 0.0;
       for (int ind = 0; ind < patch_size_total; ind++)
       {
-        error += (ref_ftr->inv_expo_time_ * patch_wrap[ind] - state->inv_expo_time * patch_buffer[ind]) *
-                 (ref_ftr->inv_expo_time_ * patch_wrap[ind] - state->inv_expo_time * patch_buffer[ind]);
+        const double residual = noise_weight *
+            (ref_ftr->inv_expo_time_ * patch_wrap[ind] - state->inv_expo_time * patch_buffer[ind]);
+        error += residual * residual;
       }
 
       if (ncc_en)
@@ -807,6 +815,15 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
   
   compute_jacobian_time = update_ekf_time = 0.0;
 
+  // Freeze the predicted noise model across every iteration and pyramid level.
+  // Exposure remains an optimized state, but cannot improve acceptance merely
+  // by changing the denominator of its own residual during the frame update.
+  vector<double> noise_weights(total_points, 1.0);
+  if (!inverse_composition_en)
+    for (int i = 0; i < total_points; ++i)
+      noise_weights[i] = flivo::photometricSqrtInformation(
+          state->inv_expo_time, visual_submap->inv_expo_list[i]);
+
   for (int level = patch_pyrimid_level - 1; level >= 0; level--)
   {
     if (inverse_composition_en)
@@ -815,7 +832,7 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
       updateStateInverse(img, level);
     }
     else
-      updateState(img, level);
+      updateState(img, level, noise_weights);
     flivo_trace::raw("vio_level", -2, level, state->pos_end[0], state->pos_end[1],
                      flivo_trace::hashBytes(state->pos_end.data(), 3 * sizeof(double)));
     flivo_trace::raw("vio_oob", -2, level, (double)flivo_oob_count, (double)flivo_patch_count, 0);
@@ -1056,61 +1073,33 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
       }
     }
 
-    float score_max = -1000.;
+    double score_max = -std::numeric_limits<double>::infinity();
     for (auto it = pt->obs_.begin(), ite = pt->obs_.end(); it != ite; ++it)
     {
       Feature *ref_patch_temp = *it;
-      float *patch_temp = ref_patch_temp->patch_;
-      float NCC_up = 0.0;
-      float NCC_down1 = 0.0;
-      float NCC_down2 = 0.0;
-      float NCC = 0.0;
-      float score = 0.0;
+      const double ref_mean = flivo::cachedPatchMean(
+          ref_patch_temp->patch_, patch_size_total, ref_patch_temp->mean_);
+      double ncc_sum = 0.;
       int count = 0;
-
-      V3D pf = ref_patch_temp->T_f_w_ * pt->pos_;
-      V3D norm_vec = ref_patch_temp->T_f_w_.rotation_matrix() * pt->normal_;
-      pf.normalize();
-      double cos_angle = pf.dot(norm_vec);
-      // if(fabs(cos_angle) < 0.86) continue; // 20 degree
-
-      float ref_mean;
-      if (abs(ref_patch_temp->mean_) < 1e-6)
-      {
-        float ref_sum = std::accumulate(patch_temp, patch_temp + patch_size_total, 0.0);
-        ref_mean = ref_sum / patch_size_total;
-        ref_patch_temp->mean_ = ref_mean;
-      }
-
       for (auto itm = pt->obs_.begin(), itme = pt->obs_.end(); itm != itme; ++itm)
       {
         if ((*itm)->id_ == ref_patch_temp->id_) continue;
-        float *patch_cache = (*itm)->patch_;
-
-        float other_mean;
-        if (abs((*itm)->mean_) < 1e-6)
-        {
-          float other_sum = std::accumulate(patch_cache, patch_cache + patch_size_total, 0.0);
-          other_mean = other_sum / patch_size_total;
-          (*itm)->mean_ = other_mean;
-        }
-
-        for (int ind = 0; ind < patch_size_total; ind++)
-        {
-          NCC_up += (patch_temp[ind] - ref_mean) * (patch_cache[ind] - other_mean);
-          NCC_down1 += (patch_temp[ind] - ref_mean) * (patch_temp[ind] - ref_mean);
-          NCC_down2 += (patch_cache[ind] - other_mean) * (patch_cache[ind] - other_mean);
-        }
-        NCC += fabs(NCC_up / sqrt(NCC_down1 * NCC_down2));
-        count++;
+        const double other_mean = flivo::cachedPatchMean(
+            (*itm)->patch_, patch_size_total, (*itm)->mean_);
+        double ncc = 0.;
+        if (!flivo::patchNCC(ref_patch_temp->patch_, (*itm)->patch_,
+                            patch_size_total, ref_mean, other_mean, ncc)) continue;
+        ncc_sum += ncc;
+        ++count;
       }
-
-      NCC = NCC / count;
-
-      score = NCC + cos_angle;
-
+      // Keep the existing reference if no textured pair can score a candidate.
+      if (count == 0) continue;
+      V3D pf = ref_patch_temp->T_f_w_ * pt->pos_;
+      V3D norm_vec = ref_patch_temp->T_f_w_.rotation_matrix() * pt->normal_;
+      if (!pf.allFinite() || pf.norm() <= 1e-12) continue;
+      const double score = ncc_sum / count + pf.normalized().dot(norm_vec);
+      if (!std::isfinite(score)) continue;
       ref_patch_temp->score_ = score;
-
       if (score > score_max)
       {
         score_max = score;
@@ -1552,7 +1541,7 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
   }
 }
 
-void VIOManager::updateState(cv::Mat img, int level)
+void VIOManager::updateState(cv::Mat img, int level, const vector<double> &noise_weights)
 {
   if (total_points == 0) return;
   StatesGroup old_state = (*state);
@@ -1664,6 +1653,8 @@ void VIOManager::updateState(cv::Mat img, int level)
 
       vector<float> P = visual_submap->warp_patch[i];
       double inv_ref_expo = visual_submap->inv_expo_list[i];
+      const double noise_weight = noise_weights[i];
+      if (noise_weight == 0.0) continue;
       // ROS_ERROR("inv_ref_expo: %.3lf, state->inv_expo_time: %.3lf\n", inv_ref_expo, state->inv_expo_time);
 
       for (int x = 0; x < patch_size; x++)
@@ -1683,7 +1674,7 @@ void VIOManager::updateState(cv::Mat img, int level)
                (w_ref_tl * img_ptr[-scale * width] + w_ref_tr * img_ptr[-scale * width + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
 
           Jimg << du, dv;
-          Jimg = Jimg * state->inv_expo_time;
+          Jimg = Jimg * (state->inv_expo_time * noise_weight);
           Jimg = Jimg * inv_scale;
           Jdphi = Jimg * Jdpi * p_hat;
           Jdp = -Jimg * Jdpi;
@@ -1692,14 +1683,14 @@ void VIOManager::updateState(cv::Mat img, int level)
 
           double cur_value =
               w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] + w_ref_br * img_ptr[scale * width + scale];
-          double res = state->inv_expo_time * cur_value - inv_ref_expo * P[patch_size_total * level + x * patch_size + y];
+          double res = noise_weight * (state->inv_expo_time * cur_value - inv_ref_expo * P[patch_size_total * level + x * patch_size + y]);
 
           z(i * patch_size_total + x * patch_size + y) = res;
 
           patch_error += res * res;
           patch_n_meas += 1;
 
-          if (exposure_estimate_en) { H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt, cur_value; }
+          if (exposure_estimate_en) { H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt, noise_weight * cur_value; }
           else { H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt; }
         }
       }
