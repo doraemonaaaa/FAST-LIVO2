@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 #include <stdexcept>
+#include <cstdlib>
+#include <iomanip>
 #include "motion_initializer.h"
 
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
@@ -44,6 +46,7 @@ void ImuProcess::Reset()
   imu_need_init = true;
   init_iter_num = 1;
   IMUpose.clear();
+  last_prop_end_time = 0.0;
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
 }
@@ -288,11 +291,29 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
   const double &imu_end_time = v_imu.back()->header.stamp.toSec();
   const double prop_beg_time = last_prop_end_time;
+  const double diagnostic_point_origin = lidar_meas.last_lio_update_time;
+  static std::ofstream diagnostic_chain([] {
+    const char *p = std::getenv("FLIVO_CHAIN_TRACE");
+    return p ? p : "";
+  }());
+  size_t diagnostic_first_point_transforms = 0;
+
   // printf("[ IMU ] undistort input size: %zu \n", lidar_meas.pcl_proc_cur->points.size());
   // printf("[ IMU ] IMU data sequence size: %zu \n", meas.imu.size());
   // printf("[ IMU ] lidar_scan_index_now: %d \n", lidar_meas.lidar_scan_index_now);
 
   const double prop_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
+
+  // Preserve the real sample timestamp across batches. Empty/single-sample
+  // batches still cover the requested interval using last-measurement hold.
+  const auto last_actual_imu = v_imu.back();
+  if (v_imu.size() < 3 && imu_end_time < prop_end_time)
+  {
+    sensor_msgs::Imu::Ptr held(new sensor_msgs::Imu(*last_actual_imu));
+    held->header.stamp.fromSec(prop_end_time);
+    v_imu.push_back(held);
+  }
+
 
   /*** cut lidar point based on the propagation-start time and required
    * propagation-end time ***/
@@ -317,6 +338,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // printf("[ IMU ] last propagation end time: %lf \n", lidar_meas.last_lio_update_time);
   if (lidar_meas.lio_vio_flg == LIO)
   {
+    IMUpose.clear();
     pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->points.size());
     pcl_wait_proc = *(lidar_meas.pcl_proc_cur);
     lidar_meas.lidar_scan_index_now = 0;
@@ -413,6 +435,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         offs_t = prop_end_time - prop_beg_time;
       }
 
+      if (dt <= 0.0) continue;
       dt_all += dt;
       // printf("[ LIO Propagation ] dt: %lf \n", dt);
 
@@ -508,7 +531,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // cout<<"[ Propagation ] output state: "<<state_inout.vel_end.transpose() <<
   // state_inout.pos_end.transpose()<<endl;
 
-  last_imu = v_imu.back();
+  last_imu = last_actual_imu;
   last_prop_end_time = prop_end_time;
 
   double t1 = omp_get_wtime();
@@ -538,6 +561,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     auto it_pcl = pcl_wait_proc.points.end() - 1;
     M3D extR_Ri(Lid_rot_to_IMU.transpose() * state_inout.rot_end.transpose());
     V3D exrR_extT(Lid_rot_to_IMU.transpose() * Lid_offset_to_IMU);
+    bool all_points_done = false;
     for (auto it_kp = IMUpose.end() - 1; it_kp != IMUpose.begin(); it_kp--)
     {
       auto head = it_kp - 1;
@@ -553,7 +577,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // printf("it_pcl->curvature: %lf pt dt: %lf \n", it_pcl->curvature,
       // it_pcl->curvature / double(1000) - head->offset_time);
 
-      for (; it_pcl->curvature / double(1000) > head->offset_time; it_pcl--)
+      for (; it_pcl->curvature / double(1000) >= head->offset_time; it_pcl--)
       {
         dt = it_pcl->curvature / double(1000) - head->offset_time;
 
@@ -567,17 +591,44 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         // Lid_offset_to_IMU) + T_ei) - Lid_offset_to_IMU);
         V3D P_compensate = (extR_Ri * (R_i * (Lid_rot_to_IMU * P_i + Lid_offset_to_IMU) + T_ei) - exrR_extT);
 
+        if (diagnostic_chain.is_open() && it_pcl == pcl_wait_proc.points.begin())
+          ++diagnostic_first_point_transforms;
         /// save Undistorted points and their rotation
         it_pcl->x = P_compensate(0);
         it_pcl->y = P_compensate(1);
         it_pcl->z = P_compensate(2);
 
-        if (it_pcl == pcl_wait_proc.points.begin()) break;
+        if (it_pcl == pcl_wait_proc.points.begin())
+        {
+          all_points_done = true;
+          break;
+        }
       }
+      if (all_points_done) break;
     }
     pcl_out = pcl_wait_proc;
     pcl_wait_proc.clear();
     IMUpose.clear();
+  }
+  if (diagnostic_chain.is_open())
+  {
+    const auto &points = lidar_meas.pcl_proc_cur->points;
+    size_t future = 0, unsorted = 0;
+    double min_t = 0, max_t = 0;
+    if (!points.empty()) min_t = max_t = points.front().curvature / 1000.0;
+    for (size_t i = 0; i < points.size(); ++i)
+    {
+      const double t = points[i].curvature / 1000.0;
+      min_t = std::min(min_t, t); max_t = std::max(max_t, t);
+      if (diagnostic_point_origin + t > prop_end_time + 1e-6) ++future;
+      if (i && points[i].curvature < points[i-1].curvature) ++unsorted;
+    }
+    diagnostic_chain << std::setprecision(17)
+      << int(lidar_meas.lio_vio_flg) << " " << prop_beg_time << " " << prop_end_time
+      << " " << diagnostic_point_origin << " " << meas.imu.size() << " " << dt_all
+      << " " << imu_beg_time << " " << imu_end_time << " " << points.size()
+      << " " << min_t << " " << max_t << " " << future << " " << unsorted
+      << " " << diagnostic_first_point_transforms << std::endl;
   }
   // printf("[ IMU ] time forward: %lf, backward: %lf.\n", t1 - t0, omp_get_wtime() - t1);
 }
@@ -654,6 +705,10 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
     }
 
+    // Startup scans are withheld, but pending points already use this image
+    // boundary as their origin. Keep the next slice and propagation consistent.
+    last_prop_end_time = pcl_end_time;
+    lidar_meas.last_lio_update_time = pcl_end_time;
     return;
   }
 

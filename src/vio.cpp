@@ -1874,6 +1874,18 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   new_frame_.reset(new Frame(cam, img));
   updateFrameState(*state);
+
+  // Diagnostic ablation: keep image-timed LIO and RGB projection, but skip
+  // visual retrieval, EKF correction and visual map mutation entirely.
+  static const bool skip_visual = [] {
+    const char *value = std::getenv("FLIVO_DIAGNOSTIC_SKIP_VISUAL");
+    return value && std::string(value) == "1";
+  }();
+  if (skip_visual)
+  {
+    ROS_WARN_ONCE("[diagnostic] Visual processing bypassed; image-timed LIO remains active.");
+    return;
+  }
   
   resetGrid();
 

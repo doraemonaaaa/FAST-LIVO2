@@ -12,6 +12,7 @@ which is included as part of this source code package.
 
 #include "LIVMapper.h"
 #include "flivo_trace.h"
+#include "livo_time_cut.h"
 
 namespace flivo_trace
 {
@@ -1166,8 +1167,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       mtx_buffer.unlock();
       sig_buffer.notify_all();
 
-      *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-      PointCloudXYZI().swap(*meas.pcl_proc_next);
+      splitPendingPointsAtImageTime(meas.pcl_proc_next->points, meas.pcl_proc_cur->points,
+                                   (img_capture_time - meas.last_lio_update_time) * 1000.0);
 
       int lid_frame_num = lid_raw_data_buffer.size();
       int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
@@ -1199,6 +1200,13 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         lid_raw_data_buffer.pop_front();
         lid_header_time_buffer.pop_front();
       }
+
+      // Individually sorted scans can overlap in time. Deskew requires the
+      // combined current cloud to be sorted as well.
+      std::stable_sort(meas.pcl_proc_cur->points.begin(), meas.pcl_proc_cur->points.end(),
+                       [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
+      std::stable_sort(meas.pcl_proc_next->points.begin(), meas.pcl_proc_next->points.end(),
+                       [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
 
       meas.measures.push_back(m);
       meas.lio_vio_flg = LIO;

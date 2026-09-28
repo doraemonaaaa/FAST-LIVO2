@@ -175,15 +175,8 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
         pl_full[i].intensity = msg->points[i].reflectivity;
         pl_full[i].curvature = msg->points[i].offset_time / float(1000000); // use curvature as time of each laser points
 
-        if (i == 0)
-          pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
-        else
-        {
-          // if(fabs(pl_full[i].curvature - pl_full[i - 1].curvature) > 1.0) ROS_ERROR("time jump: %f", fabs(pl_full[i].curvature - pl_full[i - 1].curvature));
-          pl_full[i].curvature = fabs(pl_full[i].curvature - pl_full[i - 1].curvature) < 1.0
-                                     ? pl_full[i].curvature
-                                     : pl_full[i - 1].curvature + 0.004166667f; // float(100/24000)
-        }
+        // offset_time is a measured time, not a point-rate estimate. Preserve
+        // real acquisition gaps instead of fabricating uniformly spaced points.
 
         if (valid_num % point_filter_num == 0)
         {
@@ -197,6 +190,8 @@ void Preprocess::avia_handler(const livox_ros_driver::CustomMsg::ConstPtr &msg)
       }
     }
   }
+  std::stable_sort(pl_surf.points.begin(), pl_surf.points.end(),
+                   [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
   printf("[ Preprocess ] Output point number: %zu \n", pl_surf.points.size());
 }
 
