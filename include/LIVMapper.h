@@ -15,12 +15,12 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 #include "startup_map_gate.h"
+#include "replay/startup_replay.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
-#include <vikit/camera_loader.h>
 
 class LIVMapper
 {
@@ -41,6 +41,7 @@ public:
   void handleLIO();
   void savePCD();
   void processImu();
+  StartupReplay startup_replay;
   
   bool sync_packages(LidarMeasureGroup &meas);
   void prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr);

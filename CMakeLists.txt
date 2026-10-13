@@ -121,8 +121,8 @@ include_directories(
 add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
-add_library(imu_proc src/IMU_Processing.cpp)
-add_library(laser_mapping src/LIVMapper.cpp)
+add_library(imu_proc src/IMU_Processing.cpp src/replay/imu_rewind.cpp)
+add_library(laser_mapping src/LIVMapper.cpp src/replay/startup_replay.cpp)
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)

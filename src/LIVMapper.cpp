@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include <vikit/camera_loader.h>
 #include "flivo_trace.h"
 #include "livo_time_cut.h"
 #include <stdexcept>
@@ -198,6 +199,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   }
   std::string initialization_mode;
   nh.param<std::string>("imu/initialization_mode", initialization_mode, "static_acceleration");
+  startup_replay.readParameters(nh, imu_en);
   if (initialization_mode == "imu_lidar_motion_initialization")
   {
     double acceleration_norm, velocity_sigma, gravity_sigma;
@@ -291,6 +293,7 @@ void LIVMapper::initializeComponents()
 
 void LIVMapper::initializeFiles() 
 {
+  startup_replay.initializeLog(std::string(ROOT_DIR) + "Log/initialization_replay.csv");
   if (startup_map_gate.enabled)
   {
     startup_gate_log.open(std::string(ROOT_DIR) + "Log/startup_map_gate.csv");
@@ -380,6 +383,7 @@ void LIVMapper::gravityAlignment()
 
 void LIVMapper::processImu() 
 {
+  startup_replay.cacheMeasurement(LidarMeasures);
   // double t0 = omp_get_wtime();
 
   p_imu->Process2(LidarMeasures, _state, feats_undistort);
@@ -451,6 +455,8 @@ void LIVMapper::stateEstimationAndMapping()
       handleLIO();
       break;
   }
+  if (startup_replay.pending() && !p_imu->imu_need_init && startup_map_gate.isOpen())
+    startup_replay.replay(*this);
 }
 
 void LIVMapper::handleVIO() 
@@ -502,7 +508,7 @@ void LIVMapper::handleVIO()
   // }
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
-  publish_img_rgb(pubImage, vio_manager);
+  if (!startup_replay.pending()) publish_img_rgb(pubImage, vio_manager);
 
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_out << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
@@ -558,7 +564,7 @@ void LIVMapper::handleLIO()
     state_update_flg = true;
   }
 
-  if (pose_output_en) 
+  if (pose_output_en && !startup_replay.pending())
   {
     static bool pos_opend = false;
     static int ocount = 0;
@@ -583,7 +589,7 @@ void LIVMapper::handleLIO()
   
   euler_cur = RotMtoEuler(_state.rot_end);
   geoQuat = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
-  publish_odometry(pubOdomAftMapped);
+  if (!startup_replay.pending()) publish_odometry(pubOdomAftMapped);
 
   double t3 = omp_get_wtime();
 
@@ -626,8 +632,11 @@ void LIVMapper::handleLIO()
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if (startup_map_gate.isOpen() && pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
   if (startup_map_gate.isOpen() && voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
-  publish_path(pubPath);
-  publish_mavros(mavros_pose_publisher);
+  if (!startup_replay.pending())
+  {
+    publish_path(pubPath);
+    publish_mavros(mavros_pose_publisher);
+  }
 
   frame_num++;
   aver_time_consu = aver_time_consu * (frame_num - 1) / frame_num + (t4 - t0) / frame_num;
@@ -664,6 +673,7 @@ void LIVMapper::handleLIO()
 
 void LIVMapper::savePCD() 
 {
+  startup_replay.finish();
   if (pcd_save_en && (pcl_wait_save->points.size() > 0 || pcl_wait_save_intensity->points.size() > 0) && pcd_save_interval < 0) 
   {
     std::string raw_points_dir = std::string(ROOT_DIR) + "Log/pcd/all_raw_points.pcd";
@@ -765,7 +775,7 @@ void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D 
 
 void LIVMapper::imu_prop_callback(const ros::TimerEvent &e)
 {
-  if (p_imu->imu_need_init || !new_imu || !ekf_finish_once) { return; }
+  if (startup_replay.pending() || p_imu->imu_need_init || !new_imu || !ekf_finish_once) { return; }
   mtx_buffer_imu_prop.lock();
   new_imu = false; // 控制propagate频率和IMU频率一致
   if (imu_prop_enable && !prop_imu_buffer.empty())
@@ -960,11 +970,12 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
 {
   if (!imu_en) return;
 
-  if (last_timestamp_lidar < 0.0) return;
+  if (last_timestamp_lidar < 0.0 && !startup_replay.enabled()) return;
   // ROS_INFO("get imu at time: %.6f", msg_in->header.stamp.toSec());
   sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
   msg->header.stamp = ros::Time().fromSec(msg->header.stamp.toSec() - imu_time_offset);
   double timestamp = msg->header.stamp.toSec();
+  startup_replay.cacheImu(msg);
 
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
   {
@@ -1329,7 +1340,7 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
 // Provide output format for LiDAR-visual BA
 void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager)
 {
-  if (!startup_map_gate.isOpen())
+  if (startup_replay.pending() || !startup_map_gate.isOpen())
   {
     pcl_wait_pub->clear();
     pcl_b_wait_color->clear();
