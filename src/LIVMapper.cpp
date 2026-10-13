@@ -13,6 +13,7 @@ which is included as part of this source code package.
 #include "LIVMapper.h"
 #include "flivo_trace.h"
 #include "livo_time_cut.h"
+#include <stdexcept>
 
 namespace flivo_trace
 {
@@ -120,6 +121,26 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
+  bool fixed_eigen_cache;
+  int eigen_l1_cache_bytes, eigen_l2_cache_bytes, eigen_l3_cache_bytes, eigen_threads;
+  nh.param<bool>("numerics/fixed_eigen_cache", fixed_eigen_cache, false);
+  nh.param<int>("numerics/eigen_l1_cache_bytes", eigen_l1_cache_bytes, 48 * 1024);
+  nh.param<int>("numerics/eigen_l2_cache_bytes", eigen_l2_cache_bytes, 2 * 1024 * 1024);
+  nh.param<int>("numerics/eigen_l3_cache_bytes", eigen_l3_cache_bytes, 33 * 1024 * 1024);
+  nh.param<int>("numerics/eigen_threads", eigen_threads, 1);
+  if (fixed_eigen_cache)
+  {
+    if (eigen_l1_cache_bytes <= 0 || eigen_l2_cache_bytes < eigen_l1_cache_bytes ||
+        eigen_l3_cache_bytes < eigen_l2_cache_bytes || eigen_threads <= 0)
+      throw std::invalid_argument("Invalid numerics: require 0 < L1 <= L2 <= L3 and eigen_threads > 0");
+    // Capacity assumptions for GEMM blocking, not hardware cache allocation.
+    Eigen::setCpuCacheSizes(eigen_l1_cache_bytes, eigen_l2_cache_bytes, eigen_l3_cache_bytes);
+    Eigen::setNbThreads(eigen_threads);
+    ROS_INFO_STREAM("[Numerics] fixed Eigen cache: L1=" << Eigen::l1CacheSize()
+                    << " L2=" << Eigen::l2CacheSize() << " L3=" << Eigen::l3CacheSize()
+                    << " Eigen threads=" << Eigen::nbThreads());
+  }
+
   nh.param<string>("common/lid_topic", lid_topic, "/livox/lidar");
   nh.param<string>("common/imu_topic", imu_topic, "/livox/imu");
   nh.param<bool>("common/ros_driver_bug_fix", ros_driver_fix_en, false);
