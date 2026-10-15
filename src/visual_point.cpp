@@ -15,55 +15,42 @@ which is included as part of this source code package.
 #include <stdexcept>
 #include <vikit/math_utils.h>
 
-VisualPoint::VisualPoint(const Vector3d &pos)
+VisualPoint::VisualPoint(const Vector3d &pos, size_t camera_count)
     : pos_(pos), previous_normal_(Vector3d::Zero()), normal_(Vector3d::Zero()),
-      is_converged_(false), is_normal_initialized_(false), has_ref_patch_(false)
+      is_normal_initialized_(false), camera_observations(camera_count)
 {
 }
 
-VisualPoint::~VisualPoint() 
+VisualPoint::~VisualPoint()
 {
-  for (auto it = obs_.begin(), ite = obs_.end(); it != ite; ++it)
-  {
-    delete(*it);
-  }
-  obs_.clear();
-  ref_patch = nullptr;
+  for (auto &camera : camera_observations)
+    for (auto *feature : camera.features) delete feature;
 }
 
 void VisualPoint::addFrameRef(Feature *ftr)
 {
-  obs_.push_front(ftr);
+  observations(ftr->camera_index).push_front(ftr);
 }
 
 void VisualPoint::deleteFeatureRef(Feature *ftr)
 {
-  if (ref_patch == ftr)
-  {
-    ref_patch = nullptr;
-    has_ref_patch_ = false;
-  }
-  for (auto it = obs_.begin(), ite = obs_.end(); it != ite; ++it)
-  {
-    if ((*it) == ftr)
-    {
-      delete((*it));
-      obs_.erase(it);
-      return;
-    }
-  }
+  auto &camera = camera_observations.at(ftr->camera_index);
+  if (camera.reference == ftr) { camera.reference = nullptr; camera.has_reference = false; }
+  auto &features = camera.features;
+  for (auto it = features.begin(); it != features.end(); ++it)
+    if (*it == ftr) { delete *it; features.erase(it); return; }
 }
 
-bool VisualPoint::getCloseViewObs(const Vector3d &framepos, Feature *&ftr, const Vector2d &cur_px) const
+bool VisualPoint::getCloseViewObs(const Vector3d &framepos, Feature *&ftr, const Vector2d &cur_px, size_t camera) const
 {
   // TODO: get frame with same point of view AND same pyramid level!
-  if (obs_.size() <= 0) return false;
+  if (observations(camera).size() <= 0) return false;
 
   Vector3d obs_dir(framepos - pos_);
   obs_dir.normalize();
-  auto min_it = obs_.begin();
+  auto min_it = observations(camera).begin();
   double min_cos_angle = 0;
-  for (auto it = obs_.begin(), ite = obs_.end(); it != ite; ++it)
+  for (auto it = observations(camera).begin(), ite = observations(camera).end(); it != ite; ++it)
   {
     Vector3d dir((*it)->T_f_w_.inverse().translation() - pos_);
     dir.normalize();
@@ -94,12 +81,12 @@ bool VisualPoint::getCloseViewObs(const Vector3d &framepos, Feature *&ftr, const
   return true;
 }
 
-void VisualPoint::findMinScoreFeature(const Vector3d &framepos, Feature *&ftr) const
+void VisualPoint::findMinScoreFeature(const Vector3d &framepos, Feature *&ftr, size_t camera) const
 {
-  auto min_it = obs_.begin();
+  auto min_it = observations(camera).begin();
   float min_score = std::numeric_limits<float>::max();
 
-  for (auto it = obs_.begin(), ite = obs_.end(); it != ite; ++it)
+  for (auto it = observations(camera).begin(), ite = observations(camera).end(); it != ite; ++it)
   {
     if ((*it)->score_ < min_score)
     {
@@ -110,14 +97,14 @@ void VisualPoint::findMinScoreFeature(const Vector3d &framepos, Feature *&ftr) c
   ftr = *min_it;
 }
 
-void VisualPoint::deleteNonRefPatchFeatures()
+void VisualPoint::deleteNonRefPatchFeatures(size_t camera)
 {
-  for (auto it = obs_.begin(); it != obs_.end();)
+  for (auto it = observations(camera).begin(); it != observations(camera).end();)
   {
-    if (*it != ref_patch)
+    if (*it != camera_observations.at(camera).reference)
     {
       delete *it;
-      it = obs_.erase(it);
+      it = observations(camera).erase(it);
     }
     else
     {

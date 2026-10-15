@@ -80,7 +80,7 @@ public:
   }
 };
 
-class VIOManager
+class VisualCamera
 {
 public:
   // Coarsest step getBestSearchLevel() may return. It enters the patch scale as
@@ -88,6 +88,14 @@ public:
   // it; passing it to every getBestSearchLevel() call keeps the two in sync.
   static constexpr int kMaxSearchLevel = 2;
 
+  size_t camera_index = 0, camera_count = 1;
+  string id, topic;
+  double time_offset = 0, exposure_time_offset = 0, image_timestamp = 0;
+  uint64_t image_timestamp_ns = 0;
+  int max_observations = 0;
+  bool active = false;
+  cv::Mat gray;
+  vector<double> noise_weights;
   int grid_size;
   vk::AbstractCamera *cam;
   vk::PinholeCamera *pinhole_cam;
@@ -124,11 +132,10 @@ public:
   int frame_count = 0;
   bool plot_flag;
 
-  Matrix<double, DIM_STATE, DIM_STATE> G, H_T_H;
-  MatrixXd K, H_sub_inv;
+  MatrixXd H_sub_inv;
 
   ofstream fout_camera, fout_colmap;
-  unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> feat_map;
+  unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> &feat_map;
   unordered_map<VOXEL_LOCATION, int> sub_feat_map; 
   unordered_map<int, Warp *> warp_map;
   vector<VisualPoint *> retrieve_voxel_points;
@@ -143,11 +150,15 @@ public:
     TYPE_UNKNOWN
   };
 
-  VIOManager();
-  ~VIOManager();
-  void updateStateInverse(cv::Mat img, int level);
-  void updateState(cv::Mat img, int level, const vector<double> &noise_weights);
-  void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
+  VisualCamera(unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> &map);
+  ~VisualCamera();
+  void buildResiduals(cv::Mat img, int level, const vector<double> &noise_weights,
+                      MatrixXd &H_sub, VectorXd &z, vector<float> &errors, vector<int> &counts);
+  void buildInverseResiduals(cv::Mat img, int level, MatrixXd &H_sub, VectorXd &z,
+                            vector<float> &errors, vector<int> &counts);
+  void prepareFrame(const MeasureGroup::Image &image, vector<pointWithVar> &pg,
+                    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map);
+  void finishFrame(vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
@@ -155,7 +166,6 @@ public:
   void initializeVIO();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
   bool computeProjectionJacobian(V3D p, MD(2, 3) & J);
-  void computeJacobianAndUpdateEKF(cv::Mat img);
   void resetGrid();
   void clearStartupMap();
   void updateVisualMapPoints(cv::Mat img);
@@ -187,6 +197,24 @@ public:
 
   // PointCloudXYZI::Ptr pg_down;
   // pcl::VoxelGrid<PointType> downSizeFilter;
+};
+// One parameterized pipeline for any configured camera count, including N=1.
+class VIOManager
+{
+public:
+  vector<std::unique_ptr<VisualCamera>> cameras;
+  unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> visual_map;
+  StatesGroup *state = nullptr, *state_propagat = nullptr;
+  size_t anchor_index = 0;
+  double sync_tolerance = 0.0001;
+  MatrixXd G;
+  ofstream audit;
+  ~VIOManager();
+  VisualCamera &anchor() { return *cameras.at(anchor_index); }
+  void clearStartupMap();
+  void processFrame(const vector<MeasureGroup::Image> &images, vector<pointWithVar> &pg,
+                    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map);
+  void computeJacobianAndUpdateEKF();
 };
 typedef std::shared_ptr<VIOManager> VIOManagerPtr;
 

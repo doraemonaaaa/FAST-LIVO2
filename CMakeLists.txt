@@ -75,6 +75,8 @@ else()
   message(STATUS "mimalloc not found, proceeding without it")
 endif()
 
+
+
 # Find catkin and required dependencies
 find_package(catkin REQUIRED COMPONENTS
   geometry_msgs
@@ -118,11 +120,11 @@ include_directories(
 )
 
 # Add libraries
-add_library(vio src/vio.cpp src/frame.cpp src/visual_point.cpp)
+add_library(vio src/vio.cpp src/multi_camera_vio.cpp src/frame.cpp src/visual_point.cpp)
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
 add_library(imu_proc src/IMU_Processing.cpp src/replay/imu_rewind.cpp)
-add_library(laser_mapping src/LIVMapper.cpp src/replay/startup_replay.cpp)
+add_library(laser_mapping src/LIVMapper.cpp src/multi_camera_input.cpp src/replay/startup_replay.cpp)
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
@@ -144,4 +146,11 @@ target_link_libraries(fastlivo_mapping
 # Link mimalloc if found
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
+endif()
+
+if(CATKIN_ENABLE_TESTING)
+  add_executable(multi_camera_test test/multi_camera_test.cpp)
+  target_link_libraries(multi_camera_test vio lio ${catkin_LIBRARIES} ${PCL_LIBRARIES}
+                        ${OpenCV_LIBRARIES} ${Sophus_LIBRARIES} ${Boost_LIBRARIES} ${OpenMP_CXX_LIBRARIES})
+  add_test(NAME multi_camera_algebra_and_jacobians COMMAND multi_camera_test)
 endif()

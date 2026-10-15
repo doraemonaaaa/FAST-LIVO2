@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "IMU_Processing.h"
+#include "state_numerics.h"
 #include <stdexcept>
 #include <cstdlib>
 #include <iomanip>
@@ -203,7 +204,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
   meas.last_lio_update_time = pcl_end_time;
   const double &pcl_end_offset_time = pcl_out.points.back().curvature / double(1000);
 
-  MD(DIM_STATE, DIM_STATE) F_x, cov_w;
+  MatrixXd F_x(state_inout.dimension(), state_inout.dimension()), cov_w(state_inout.dimension(), state_inout.dimension());
   double dt = 0;
 
   if (b_first_frame)
@@ -248,7 +249,7 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
 
   // std::cout << "before propagete:" << state_inout.cov.diagonal().transpose()
   //           << std::endl;
-  state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
+  propagateStateCovariance(state_inout, F_x, cov_w);
   // std::cout << "cov_w:" << cov_w.diagonal().transpose() << std::endl;
   // std::cout << "after propagete:" << state_inout.cov.diagonal().transpose()
   //           << std::endl;
@@ -362,7 +363,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   V3D acc_imu(acc_s_last), angvel_avr(angvel_last), acc_avr, vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
   // cout << "[ IMU ] input state: " << state_inout.vel_end.transpose() << " " << state_inout.pos_end.transpose() << endl;
   M3D R_imu(state_inout.rot_end);
-  MD(DIM_STATE, DIM_STATE) F_x, cov_w;
+  MatrixXd F_x(state_inout.dimension(), state_inout.dimension()), cov_w(state_inout.dimension(), state_inout.dimension());
   double dt, dt_all = 0.0;
   double offs_t;
   // double imu_time;
@@ -457,13 +458,15 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
 
       // tau = 1.0 / (0.25 * sin(2 * CV_PI * 0.5 * imu_time) + 0.75);
       // F_x(6,6) = 0.25 * 2 * CV_PI * 0.5 * cos(2 * CV_PI * 0.5 * imu_time) * (-tau*tau); F_x(18,18) = 0.00001;
-      if (exposure_estimate_en) cov_w(6, 6) = cov_inv_expo * dt * dt;
+      if (exposure_estimate_en)
+        for (size_t k = 0; k <= size_t(state_inout.extra_exposures.size()); ++k)
+          cov_w(StatesGroup::exposureIndex(k), StatesGroup::exposureIndex(k)) = cov_inv_expo * dt * dt;
       cov_w.block<3, 3>(0, 0).diagonal() = cov_gyr * dt * dt;
       cov_w.block<3, 3>(7, 7) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
       cov_w.block<3, 3>(10, 10).diagonal() = cov_bias_gyr * dt * dt; // bias gyro covariance
       cov_w.block<3, 3>(13, 13).diagonal() = cov_bias_acc * dt * dt; // bias acc covariance
 
-      state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
+      propagateStateCovariance(state_inout, F_x, cov_w);
       // state_inout.cov.block<18,18>(0,0) = F_x.block<18,18>(0,0) *
       // state_inout.cov.block<18,18>(0,0) * F_x.block<18,18>(0,0).transpose() +
       // cov_w.block<18,18>(0,0);

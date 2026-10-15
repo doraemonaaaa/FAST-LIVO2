@@ -26,6 +26,8 @@ struct Feature
     EDGELET
   };
   int id_;
+  size_t camera_index = 0;
+  double timestamp = 0;
   FeatureType type_;     //!< Type can be corner or edgelet.
   cv::Mat img_;          //!< Image associated with the patch feature
   Vector2d px_;          //!< Coordinates in pixels on pyramid level 0.

@@ -65,6 +65,26 @@ struct MeasureGroup
   double lio_time;
   deque<sensor_msgs::Imu::ConstPtr> imu;
   cv::Mat img;
+  struct Image
+  {
+    size_t camera_index = 0;
+    double timestamp = 0;
+    cv::Mat pixels;
+    uint64_t timestamp_ns = 0;
+  };
+  vector<Image> images;
+  void cloneImages()
+  {
+    const auto *primary_data = img.data;
+    bool found = false;
+    for (auto &image : images)
+    {
+      const bool primary = image.pixels.data == primary_data;
+      image.pixels = image.pixels.clone();
+      if (primary) { img = image.pixels; found = true; }
+    }
+    if (!found) img = img.clone();
+  }
   MeasureGroup()
   {
     vio_time = 0.0;
@@ -125,6 +145,22 @@ typedef struct pointWithVar
 
 struct StatesGroup
 {
+  // Keep the original 19 indices; cameras 1..N-1 append independent exposure
+  // states. All updates use this full covariance, including cross correlations.
+  VectorXd extra_exposures;
+  int dimension() const { return DIM_STATE + extra_exposures.size(); }
+  static int exposureIndex(size_t camera) { return camera == 0 ? 6 : DIM_STATE + camera - 1; }
+  double &exposure(size_t camera) { return camera == 0 ? inv_expo_time : extra_exposures(camera - 1); }
+  double exposure(size_t camera) const { return camera == 0 ? inv_expo_time : extra_exposures(camera - 1); }
+  void configureCameras(size_t count)
+  {
+    if (!count) throw std::invalid_argument("State requires at least one camera slot");
+    extra_exposures = VectorXd::Ones(count - 1);
+    MatrixXd enlarged = MatrixXd::Zero(dimension(), dimension());
+    enlarged.topLeftCorner(DIM_STATE, DIM_STATE) = cov.topLeftCorner(DIM_STATE, DIM_STATE);
+    for (size_t k = 1; k < count; ++k) enlarged(exposureIndex(k), exposureIndex(k)) = 0.00001;
+    cov = enlarged;
+  }
   StatesGroup()
   {
     this->rot_end = M3D::Identity();
@@ -149,6 +185,7 @@ struct StatesGroup
     this->gravity = b.gravity;
     this->inv_expo_time = b.inv_expo_time;
     this->cov = b.cov;
+    this->extra_exposures = b.extra_exposures;
   };
 
   StatesGroup &operator=(const StatesGroup &b)
@@ -161,12 +198,13 @@ struct StatesGroup
     this->gravity = b.gravity;
     this->inv_expo_time = b.inv_expo_time;
     this->cov = b.cov;
+    this->extra_exposures = b.extra_exposures;
     return *this;
   };
 
-  StatesGroup operator+(const Matrix<double, DIM_STATE, 1> &state_add)
+  StatesGroup operator+(const VectorXd &state_add)
   {
-    StatesGroup a;
+    StatesGroup a(*this);
     a.rot_end = this->rot_end * Exp(state_add(0, 0), state_add(1, 0), state_add(2, 0));
     a.pos_end = this->pos_end + state_add.block<3, 1>(3, 0);
     a.inv_expo_time = this->inv_expo_time + state_add(6, 0);
@@ -174,12 +212,13 @@ struct StatesGroup
     a.bias_g = this->bias_g + state_add.block<3, 1>(10, 0);
     a.bias_a = this->bias_a + state_add.block<3, 1>(13, 0);
     a.gravity = this->gravity + state_add.block<3, 1>(16, 0);
+    a.extra_exposures += state_add.tail(extra_exposures.size());
 
     a.cov = this->cov;
     return a;
   };
 
-  StatesGroup &operator+=(const Matrix<double, DIM_STATE, 1> &state_add)
+  StatesGroup &operator+=(const VectorXd &state_add)
   {
     this->rot_end = this->rot_end * Exp(state_add(0, 0), state_add(1, 0), state_add(2, 0));
     this->pos_end += state_add.block<3, 1>(3, 0);
@@ -188,12 +227,13 @@ struct StatesGroup
     this->bias_g += state_add.block<3, 1>(10, 0);
     this->bias_a += state_add.block<3, 1>(13, 0);
     this->gravity += state_add.block<3, 1>(16, 0);
+    this->extra_exposures += state_add.tail(extra_exposures.size());
     return *this;
   };
 
-  Matrix<double, DIM_STATE, 1> operator-(const StatesGroup &b)
+  VectorXd operator-(const StatesGroup &b) const
   {
-    Matrix<double, DIM_STATE, 1> a;
+    VectorXd a(dimension());
     M3D rotd(b.rot_end.transpose() * this->rot_end);
     a.block<3, 1>(0, 0) = Log(rotd);
     a.block<3, 1>(3, 0) = this->pos_end - b.pos_end;
@@ -202,6 +242,7 @@ struct StatesGroup
     a.block<3, 1>(10, 0) = this->bias_g - b.bias_g;
     a.block<3, 1>(13, 0) = this->bias_a - b.bias_a;
     a.block<3, 1>(16, 0) = this->gravity - b.gravity;
+    a.tail(extra_exposures.size()) = extra_exposures - b.extra_exposures;
     return a;
   };
 
@@ -219,7 +260,7 @@ struct StatesGroup
   V3D bias_g;                               // gyroscope bias
   V3D bias_a;                               // accelerator bias
   V3D gravity;                              // the estimated gravity acceleration
-  Matrix<double, DIM_STATE, DIM_STATE> cov; // states covariance
+  MatrixXd cov; // full motion/exposure covariance, dimension 18 + camera count
 };
 
 template <typename T>

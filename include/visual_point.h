@@ -29,20 +29,29 @@ public:
   Vector3d normal_;             //!< Surface normal at point.
   Matrix3d normal_information_; //!< Inverse covariance matrix of normal estimation.
   Vector3d previous_normal_;    //!< Last updated normal vector.
-  list<Feature *> obs_;         //!< Reference patches which observe the point.
+  struct CameraObservation
+  {
+    list<Feature *> features;
+    Feature *reference = nullptr;
+    bool has_reference = false;
+    bool reference_converged = false;
+  };
+  vector<CameraObservation> camera_observations;
+  list<Feature *> &observations(size_t camera) { return camera_observations.at(camera).features; }
+  const list<Feature *> &observations(size_t camera) const { return camera_observations.at(camera).features; }
+  Feature *&referencePatch(size_t camera) { return camera_observations.at(camera).reference; }
+  bool &hasReference(size_t camera) { return camera_observations.at(camera).has_reference; }
+  bool &referenceConverged(size_t camera) { return camera_observations.at(camera).reference_converged; }
   Eigen::Matrix3d covariance_;  //!< Covariance of the point.
-  bool is_converged_;           //!< True if the point is converged.
   bool is_normal_initialized_;  //!< True if the normal is initialized.
-  bool has_ref_patch_;          //!< True if the point has a reference patch.
-  Feature *ref_patch;           //!< Reference patch of the point.
 
-  VisualPoint(const Vector3d &pos);
+  VisualPoint(const Vector3d &pos, size_t camera_count);
   ~VisualPoint();
-  void findMinScoreFeature(const Vector3d &framepos, Feature *&ftr) const;
-  void deleteNonRefPatchFeatures();
+  void findMinScoreFeature(const Vector3d &framepos, Feature *&ftr, size_t camera) const;
+  void deleteNonRefPatchFeatures(size_t camera);
   void deleteFeatureRef(Feature *ftr);
   void addFrameRef(Feature *ftr);
-  bool getCloseViewObs(const Vector3d &pos, Feature *&obs, const Vector2d &cur_px) const;
+  bool getCloseViewObs(const Vector3d &pos, Feature *&obs, const Vector2d &cur_px, size_t camera) const;
 };
 
 #endif // LIVO_POINT_H_

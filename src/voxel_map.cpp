@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "voxel_map.h"
+#include "state_numerics.h"
 
 namespace
 {
@@ -373,7 +374,8 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   pv_list_.resize(feats_down_size_);
 
   int rematch_num = 0;
-  MD(DIM_STATE, DIM_STATE) G, H_T_H, I_STATE;
+  const int dimension = state_.dimension();
+  MatrixXd G(dimension, dimension), H_T_H(dimension, dimension), I_STATE(dimension, dimension);
   G.setZero();
   H_T_H.setZero();
   I_STATE.setIdentity();
@@ -469,17 +471,20 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     EKF_stop_flg = false;
     flg_EKF_converged = false;
     /*** Iterative Kalman Filter Update ***/
-    MatrixXd K(DIM_STATE, effct_feat_num_);
+    MatrixXd K(dimension, effct_feat_num_);
     // auto &&Hsub_T = Hsub.transpose();
     auto &&HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
-    MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
-    G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
+    MatrixXd K_1 = inverseStateMatrix(H_T_H + inverseStateMatrix(state_.cov));
+    G.block(0, 0, dimension, 6) = gainInformation<6>(K_1, H_T_H.block<6, 6>(0, 0));
     auto vec = state_propagat - state_;
-    VD(DIM_STATE)
-    solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+    VectorXd solution(dimension);
+    solution.head<DIM_STATE>() = K_1.block<DIM_STATE,6>(0,0)*HTz + vec.head<DIM_STATE>()
+                                - G.block<DIM_STATE,6>(0,0)*vec.head<6>();
+    if (dimension>DIM_STATE) solution.tail(dimension-DIM_STATE) = K_1.block(DIM_STATE,0,dimension-DIM_STATE,6)*HTz
+      + vec.tail(dimension-DIM_STATE)-G.block(DIM_STATE,0,dimension-DIM_STATE,6)*vec.head<6>();
     int minRow, minCol;
     state_ += solution;
     auto rot_add = solution.block<3, 1>(0, 0);
@@ -496,8 +501,11 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     {
       /*** Covariance Update ***/
       // _state.cov = (I_STATE - G) * _state.cov;
-      state_.cov.block<DIM_STATE, DIM_STATE>(0, 0) =
-          (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
+      const MD(DIM_STATE,DIM_STATE) covariance = state_.cov.topLeftCorner<DIM_STATE,DIM_STATE>();
+      const MD(DIM_STATE,DIM_STATE) correction = (I_STATE-G).topLeftCorner<DIM_STATE,DIM_STATE>();
+      MatrixXd posterior = (I_STATE-G)*state_.cov;
+      posterior.topLeftCorner<DIM_STATE,DIM_STATE>() = correction*covariance;
+      state_.cov = posterior;
       // total_distance += (_state.pos_end - position_last).norm();
       position_last_ = state_.pos_end;
       geoQuat_ = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));

@@ -52,14 +52,17 @@ void StartupReplay::cacheMeasurement(const LidarMeasureGroup &group)
   for (const auto &cloud : {group.lidar, group.pcl_proc_cur, group.pcl_proc_next})
     if (cloud) bytes += cloud->size() * sizeof(PointType);
   for (const auto &m : group.measures)
-    bytes += m.img.total() * m.img.elemSize() + m.imu.size() * sizeof(sensor_msgs::Imu);
+  {
+    bytes += m.imu.size() * sizeof(sensor_msgs::Imu);
+    for (const auto &image : m.images) bytes += image.pixels.total() * image.pixels.elemSize();
+  }
   if (bytes > limit_ || bytes_ > limit_ - bytes)
     throw std::runtime_error("Initialization replay cache limit exceeded; no startup data was silently discarded");
   LidarMeasureGroup saved = group;
   if (group.lidar) saved.lidar.reset(new PointCloudXYZI(*group.lidar));
   if (group.pcl_proc_cur) saved.pcl_proc_cur.reset(new PointCloudXYZI(*group.pcl_proc_cur));
   if (group.pcl_proc_next) saved.pcl_proc_next.reset(new PointCloudXYZI(*group.pcl_proc_next));
-  for (auto &m : saved.measures) m.img = m.img.clone();
+  for (auto &m : saved.measures) m.cloneImages();
   measurements_.push_back(std::move(saved));
   bytes_ += bytes;
 }

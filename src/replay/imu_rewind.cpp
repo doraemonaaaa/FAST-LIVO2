@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "IMU_Processing.h"
+#include "state_numerics.h"
 #include <stdexcept>
 
 void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double begin,
@@ -52,8 +53,8 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
     V3D velocity = state.vel_end - acceleration * dt;
     state.pos_end -= velocity * dt + .5 * acceleration * dt * dt;
     state.vel_end = velocity;
-    MD(DIM_STATE, DIM_STATE) F = MD(DIM_STATE, DIM_STATE)::Identity();
-    MD(DIM_STATE, DIM_STATE) Q = MD(DIM_STATE, DIM_STATE)::Zero();
+    MatrixXd F = MatrixXd::Identity(state.dimension(), state.dimension());
+    MatrixXd Q = MatrixXd::Zero(state.dimension(), state.dimension());
     F.block<3,3>(0,0) = Exp(omega, -dt);
     if (ba_bg_est_en) F.block<3,3>(0,10) = -Eye3d * dt;
     F.block<3,3>(3,7) = Eye3d * dt;
@@ -65,9 +66,21 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
     Q.block<3,3>(7,7) = rotation * cov_acc.asDiagonal() * rotation.transpose() * dt * dt;
     Q.block<3,3>(10,10).diagonal() = cov_bias_gyr * dt * dt;
     Q.block<3,3>(13,13).diagonal() = cov_bias_acc * dt * dt;
-    if (exposure_estimate_en) Q(6,6) = cov_inv_expo * dt * dt;
-    MD(DIM_STATE, DIM_STATE) inverse = F.inverse();
-    state.cov = inverse * (state.cov + Q) * inverse.transpose();
+    if (exposure_estimate_en)
+      for (size_t k = 0; k <= size_t(state.extra_exposures.size()); ++k)
+        Q(StatesGroup::exposureIndex(k), StatesGroup::exposureIndex(k)) = cov_inv_expo * dt * dt;
+    const MD(DIM_STATE,DIM_STATE) base = F.topLeftCorner<DIM_STATE,DIM_STATE>();
+    const MD(DIM_STATE,DIM_STATE) inverse = base.inverse();
+    const MD(DIM_STATE,DIM_STATE) covariance = state.cov.topLeftCorner<DIM_STATE,DIM_STATE>();
+    const MD(DIM_STATE,DIM_STATE) noise = Q.topLeftCorner<DIM_STATE,DIM_STATE>();
+    state.cov.topLeftCorner<DIM_STATE,DIM_STATE>() = inverse*(covariance+noise)*inverse.transpose();
+    const int extra = state.dimension()-DIM_STATE;
+    if (extra)
+    {
+      state.cov.topRightCorner(DIM_STATE,extra) = (inverse*state.cov.topRightCorner(DIM_STATE,extra)).eval();
+      state.cov.bottomLeftCorner(extra,DIM_STATE) = (state.cov.bottomLeftCorner(extra,DIM_STATE)*inverse.transpose()).eval();
+      state.cov.bottomRightCorner(extra,extra) += Q.bottomRightCorner(extra,extra);
+    }
     state.rot_end = rotation;
     cursor = left;
   }

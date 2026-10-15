@@ -29,6 +29,11 @@ public:
   ~LIVMapper();
   void initializeSubscribersAndPublishers(ros::NodeHandle &nh, image_transport::ImageTransport &it);
   void initializeComponents();
+  void configureCameras();
+  bool prepareImageBundle(double timestamp);
+  void consumeImageBundle();
+  void saveCameraImages(const string &stamp, double timestamp);
+  ofstream camera_frames_log;
   void initializeFiles();
   void updateStartupMapGate();
   StartupMapGate startup_map_gate;
@@ -53,7 +58,7 @@ public:
   void standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg);
   void livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_in);
   void imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in);
-  void img_cbk(const sensor_msgs::ImageConstPtr &msg_in);
+  void img_cbk(const sensor_msgs::ImageConstPtr &msg_in, size_t camera_index);
   void publish_img_rgb(const image_transport::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
   void publish_visual_sub_map(const ros::Publisher &pubSubVisualMap);
@@ -126,8 +131,19 @@ public:
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;
   deque<double> lid_header_time_buffer;
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
-  deque<cv::Mat> img_buffer;
-  deque<double> img_time_buffer;
+  struct CameraQueue
+  {
+    deque<cv::Mat> images;
+    deque<double> times;
+    deque<uint64_t> stamps;
+    double last_timestamp = -1;
+    int subsample_counter = 0;
+  };
+  vector<CameraQueue> camera_queues;
+  vector<MeasureGroup::Image> pending_images;
+  double camera_maximum_lateness = 0.5;
+  deque<cv::Mat> &imageBuffer() { return camera_queues.at(vio_manager->anchor_index).images; }
+  deque<double> &imageTimes() { return camera_queues.at(vio_manager->anchor_index).times; }
   vector<pointWithVar> _pv_list;
   vector<double> extrinT;
   vector<double> extrinR;
@@ -170,7 +186,7 @@ public:
   ros::Publisher voxel_pub;
   ros::Subscriber sub_pcl;
   ros::Subscriber sub_imu;
-  ros::Subscriber sub_img;
+  vector<ros::Subscriber> image_subscribers;
   ros::Publisher pubLaserCloudFullRes;
   ros::Publisher pubNormal;
   ros::Publisher pubSubVisualMap;
