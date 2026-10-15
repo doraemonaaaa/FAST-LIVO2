@@ -177,26 +177,7 @@ void LIVMapper::readParameters(ros::NodeHandle &nh)
   nh.param<bool>("imu/imu_en", imu_en, false);
   nh.param<bool>("imu/gravity_est_en", gravity_est_en, true);
   nh.param<bool>("imu/ba_bg_est_en", ba_bg_est_en, true);
-  nh.param<bool>("startup_map_gate/enabled", startup_map_gate.enabled, false);
-  if (startup_map_gate.enabled)
-  {
-    auto threshold = [&](const std::string &name, auto &value) {
-      if (!nh.getParam("startup_map_gate/" + name, value))
-        throw std::runtime_error("Missing startup_map_gate/" + name);
-    };
-    threshold("minimum_seconds", startup_map_gate.minimum_seconds);
-    threshold("maximum_seconds", startup_map_gate.maximum_seconds);
-    threshold("maximum_gap_seconds", startup_map_gate.maximum_gap_seconds);
-    threshold("consecutive_frames", startup_map_gate.consecutive_frames);
-    threshold("minimum_matches", startup_map_gate.minimum_matches);
-    threshold("minimum_match_ratio", startup_map_gate.minimum_match_ratio);
-    threshold("maximum_residual_m", startup_map_gate.maximum_residual);
-    threshold("maximum_translation_correction_m", startup_map_gate.maximum_translation);
-    threshold("maximum_rotation_correction_rad", startup_map_gate.maximum_rotation);
-    threshold("maximum_velocity_correction_mps", startup_map_gate.maximum_velocity);
-    threshold("maximum_gravity_correction_mps2", startup_map_gate.maximum_gravity);
-    startup_map_gate.validate();
-  }
+  nh.param<bool>("initialization_diagnostics/enabled", initialization_diagnostics.enabled, true);
   std::string initialization_mode;
   nh.param<std::string>("imu/initialization_mode", initialization_mode, "static_acceleration");
   startup_replay.readParameters(nh, imu_en);
@@ -275,12 +256,7 @@ void LIVMapper::initializeComponents()
 void LIVMapper::initializeFiles() 
 {
   startup_replay.initializeLog(std::string(ROOT_DIR) + "Log/initialization_replay.csv");
-  if (startup_map_gate.enabled)
-  {
-    startup_gate_log.open(std::string(ROOT_DIR) + "Log/startup_map_gate.csv");
-    if (!startup_gate_log) throw std::runtime_error("Cannot create startup map gate log");
-    startup_gate_log << "timestamp,phase,stable_frames,matches,points,residual_m,translation_correction_m,rotation_correction_rad,velocity_correction_mps,gravity_correction_mps2,event\n";
-  }
+  initialization_diagnostics.initializeLog(std::string(ROOT_DIR) + "Log/initialization_diagnostics.csv");
   if (pcd_save_en && colmap_output_en)
   {
       const std::string folderPath = std::string(ROOT_DIR) + "/scripts/colmap_output.sh";
@@ -384,9 +360,9 @@ void LIVMapper::processImu()
   // std::cout << "[ Mapping ] predict sta: " << state_propagat.pos_end.transpose() << state_propagat.vel_end.transpose() << std::endl;
 }
 
-void LIVMapper::updateStartupMapGate()
+void LIVMapper::recordInitializationDiagnostics()
 {
-  if (startup_map_gate.isOpen()) return;
+  if (!initialization_diagnostics.enabled) return;
   const auto &pairs = voxelmap_manager->ptpl_list_;
   double squared = 0;
   for (const auto &pair : pairs) squared += double(pair.dis_to_plane_) * pair.dis_to_plane_;
@@ -396,34 +372,13 @@ void LIVMapper::updateStartupMapGate()
   double velocity = (_state.vel_end - state_propagat.vel_end).norm();
   double gravity = (_state.gravity - state_propagat.gravity).norm();
   const double stamp = LidarMeasures.last_lio_update_time;
-  // Record the observation before updating, so timeout also leaves diagnostics.
-  startup_gate_log << std::setprecision(16) << stamp << ',' << startup_map_gate.phase << ','
-                   << startup_map_gate.stable << ',' << pairs.size() << ',' << feats_down_size << ','
-                   << residual << ',' << translation << ',' << rotation << ',' << velocity << ',' << gravity;
-  StartupMapGate::Event event;
-  try { event = startup_map_gate.update(stamp, pairs.size(), feats_down_size, residual,
-                                      translation, rotation, velocity, gravity); }
-  catch (...) { startup_gate_log << ",timeout_or_invalid\n" << std::flush; throw; }
-  startup_gate_log << ',' << event << '\n' << std::flush;
-  if (event != StartupMapGate::None)
-  {
-    // Preserve EKF/IMU state, trajectory gauge and timestamps. Current stable
-    // scan seeds fresh geometry in UpdateVoxelMap immediately after this call.
-    vio_manager->clearStartupMap();
-    for (auto &item : voxelmap_manager->voxel_map_) delete item.second;
-    voxelmap_manager->voxel_map_.clear();
-    voxelmap_manager->ptpl_list_.clear();
-    voxelmap_manager->last_slide_position = _state.pos_end;
-    pcl_wait_pub->clear();
-    pcl_b_wait_color->clear();
-    pcl_wait_save->clear();
-    pcl_wait_save_intensity->clear();
-    ROS_WARN("[map gate] %s at %.6f (%.2f s after first LIO); rebuilt LiDAR and visual maps, retained estimator state",
-             event == StartupMapGate::Admit ? "OPEN" : "RECHECK", stamp, stamp - startup_map_gate.start);
-  }
-  else ROS_INFO_THROTTLE(2.0, "[map gate] warming up: stable %d/%d, match ratio %.3f, residual %.3f m",
-                        startup_map_gate.stable, startup_map_gate.consecutive_frames,
-                        feats_down_size ? double(pairs.size()) / feats_down_size : 0, residual);
+  const char *stage = startup_replay.pending() ? "initializing" :
+                      startup_replay.replaying() ? "replay" : "live";
+  initialization_diagnostics.record(stamp, stage, pairs.size(), feats_down_size, residual,
+                             translation, rotation, velocity, gravity);
+  ROS_INFO_THROTTLE(2.0, "[initialization diagnostics] stage=%s match_ratio=%.3f residual=%.4f m translation=%.4f m rotation=%.4f rad velocity=%.4f m/s gravity=%.4f m/s2",
+                    stage, feats_down_size ? double(pairs.size()) / feats_down_size : 0,
+                    residual, translation, rotation, velocity, gravity);
 }
 
 void LIVMapper::stateEstimationAndMapping() 
@@ -438,7 +393,7 @@ void LIVMapper::stateEstimationAndMapping()
       handleLIO();
       break;
   }
-  if (startup_replay.pending() && !p_imu->imu_need_init && startup_map_gate.isOpen())
+  if (startup_replay.pending() && !p_imu->imu_need_init)
     startup_replay.replay(*this);
 }
 
@@ -587,7 +542,7 @@ void LIVMapper::handleLIO()
           (-point_crossmat) * _state.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + _state.cov.block<3, 3>(3, 3);
     voxelmap_manager->pv_list_[i].var = var;
   }
-  updateStartupMapGate();
+  recordInitializationDiagnostics();
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
   std::cout << "[ LIO ] Update Voxel Map" << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
@@ -613,8 +568,8 @@ void LIVMapper::handleLIO()
   *pcl_b_wait_pub = *laserCloudBody;
 
   publish_frame_world(pubLaserCloudFullRes, vio_manager);
-  if (startup_map_gate.isOpen() && pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
-  if (startup_map_gate.isOpen() && voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
+  if (!startup_replay.pending() && pub_effect_point_en) publish_effect_world(pubLaserCloudEffect, voxelmap_manager->ptpl_list_);
+  if (!startup_replay.pending() && voxelmap_manager->config_setting_.is_pub_plane_map_) voxelmap_manager->pubVoxelMap();
   if (!startup_replay.pending())
   {
     publish_path(pubPath);
@@ -1271,7 +1226,7 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
 // Provide output format for LiDAR-visual BA
 void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager)
 {
-  if (startup_replay.pending() || !startup_map_gate.isOpen())
+  if (startup_replay.pending())
   {
     pcl_wait_pub->clear();
     pcl_b_wait_color->clear();

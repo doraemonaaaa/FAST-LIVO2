@@ -20,7 +20,7 @@ which is included as part of this source code package.
 
 class LIVMapper;
 
-// Owns startup data until initialization and map admission allow chronological
+// Owns startup data until IMU initialization allows chronological
 // replay. Sensor synchronization and normal LIO/VIO updates remain in LIVMapper.
 class StartupReplay
 {
@@ -29,6 +29,7 @@ public:
   void initializeLog(const std::string &path);
   bool enabled() const { return enabled_; }
   bool pending() const { return enabled_ && !replay_started_; }
+  bool replaying() const { return replaying_; }
   void cacheImu(const sensor_msgs::Imu::ConstPtr &imu);
   void cacheMeasurement(const LidarMeasureGroup &group);
   void replay(LIVMapper &mapper);
@@ -38,6 +39,7 @@ private:
   bool enabled_ = false;
   // Set before executing cached updates: they must publish and must not recache.
   bool replay_started_ = false;
+  bool replaying_ = false;
   size_t bytes_ = 0, limit_ = 0;
   std::deque<LidarMeasureGroup> measurements_;
   std::deque<sensor_msgs::Imu::ConstPtr> imu_samples_;

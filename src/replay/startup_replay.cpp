@@ -99,6 +99,7 @@ void StartupReplay::replay(LIVMapper &mapper)
   mapper.pcl_wait_save->clear(); mapper.pcl_wait_save_intensity->clear();
   mapper.path.poses.clear();
   replay_started_ = true;
+  replaying_ = true;
   log_ << std::setprecision(17) << "begin," << begin << ',' << end << ','
       << measurements_.size() << ',' << bytes_ << '\n' << std::flush;
   ROS_WARN("[startup replay] replaying %zu groups from %.9f to %.9f; cache %.1f MiB",
@@ -116,6 +117,7 @@ void StartupReplay::replay(LIVMapper &mapper)
         << ',' << count << ",0\n";
   }
   mapper.LidarMeasures = live;
+  replaying_ = false;
   log_ << std::setprecision(17) << "complete," << begin << ',' << end
       << ',' << count << ',' << bytes_ << '\n' << std::flush;
   bytes_ = 0;
@@ -126,5 +128,5 @@ void StartupReplay::finish()
 {
   log_.flush();
   if (pending() && !measurements_.empty())
-    throw std::runtime_error("Recording ended before initialization/map admission; startup replay is incomplete");
+    throw std::runtime_error("Recording ended before IMU initialization; startup replay is incomplete");
 }

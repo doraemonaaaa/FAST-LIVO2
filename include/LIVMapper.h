@@ -14,7 +14,7 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
-#include "startup_map_gate.h"
+#include "replay/initialization_diagnostics.h"
 #include "replay/startup_replay.h"
 #include "vio.h"
 #include "preprocess.h"
@@ -35,9 +35,8 @@ public:
   void saveCameraImages(const string &stamp, double timestamp);
   ofstream camera_frames_log;
   void initializeFiles();
-  void updateStartupMapGate();
-  StartupMapGate startup_map_gate;
-  std::ofstream startup_gate_log;
+  void recordInitializationDiagnostics();
+  InitializationDiagnostics initialization_diagnostics;
   void run();
   void gravityAlignment();
   void handleFirstFrame();
