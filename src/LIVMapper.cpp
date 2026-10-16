@@ -114,6 +114,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
+  startup_replay.restore(*this);
   path.header.stamp = ros::Time::now();
   path.header.frame_id = "camera_init";
 }
@@ -342,7 +343,7 @@ void LIVMapper::gravityAlignment()
 
 void LIVMapper::processImu() 
 {
-  startup_replay.cacheMeasurement(LidarMeasures);
+  startup_replay.observeMeasurement(LidarMeasures);
   // double t0 = omp_get_wtime();
 
   p_imu->Process2(LidarMeasures, _state, feats_undistort);
@@ -393,8 +394,7 @@ void LIVMapper::stateEstimationAndMapping()
       handleLIO();
       break;
   }
-  if (startup_replay.pending() && !p_imu->imu_need_init)
-    startup_replay.replay(*this);
+  startup_replay.afterUpdate(*this);
 }
 
 void LIVMapper::handleVIO() 
@@ -505,8 +505,7 @@ void LIVMapper::handleLIO()
   if (pose_output_en && !startup_replay.pending())
   {
     static bool pos_opend = false;
-    static int ocount = 0;
-    std::ofstream outFile, evoFile;
+    std::ofstream evoFile;
     if (!pos_opend) 
     {
       evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::out);
@@ -518,7 +517,6 @@ void LIVMapper::handleLIO()
       evoFile.open(std::string(ROOT_DIR) + "Log/result/" + seq_name + ".txt", std::ios::app);
       if (!evoFile.is_open()) ROS_ERROR("open fail\n");
     }
-    Eigen::Matrix4d outT;
     Eigen::Quaterniond q(_state.rot_end);
     evoFile << std::fixed;
     evoFile << LidarMeasures.last_lio_update_time << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " " << _state.pos_end[2] << " "
@@ -666,6 +664,7 @@ void LIVMapper::run()
   while (ros::ok()) 
   {
     ros::spinOnce();
+    startup_replay.prepareNextInput(LidarMeasures);
     if (!sync_packages(LidarMeasures))
     {
       rate.sleep();
@@ -682,9 +681,9 @@ void LIVMapper::run()
 
     flivo_trace::state("post_imu", trace_frame, _state);
 
-    // if (!p_imu->imu_time_init) continue;
-
     stateEstimationAndMapping();
+
+    if (startup_replay.prepared()) break;
 
     flivo_trace::state("post_est", trace_frame, _state);
   }
@@ -913,7 +912,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
   sensor_msgs::Imu::Ptr msg(new sensor_msgs::Imu(*msg_in));
   msg->header.stamp = ros::Time().fromSec(msg->header.stamp.toSec() - imu_time_offset);
   double timestamp = msg->header.stamp.toSec();
-  startup_replay.cacheImu(msg);
+  startup_replay.retainImuForInitialization(msg);
 
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
   {

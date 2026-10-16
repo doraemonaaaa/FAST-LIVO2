@@ -1,132 +1,186 @@
-/* 
-This file is part of FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry.
-
-Developer: Chunran Zheng <zhengcr@connect.hku.hk>
-
-For commercial use, please contact me at <zhengcr@connect.hku.hk> or
-Prof. Fu Zhang at <fuzhang@hku.hk>.
-
-This file is subject to the terms and conditions outlined in the 'LICENSE' file,
-which is included as part of this source code package.
-*/
-
 #include "replay/startup_replay.h"
+#include "replay/initialization_checkpoint.h"
 #include "LIVMapper.h"
-#include <iomanip>
 #include <map>
-#include <stdexcept>
+#include <cstdio>
+#include <ros/serialization.h>
 
 void StartupReplay::readParameters(ros::NodeHandle &nh, bool imu_en)
 {
-  nh.param<bool>("imu/initialization_replay", enabled_, false);
-  int initialization_replay_max_mb;
-  nh.param<int>("imu/initialization_replay_max_mb", initialization_replay_max_mb, 2048);
-  if (enabled_ && (!imu_en || initialization_replay_max_mb <= 0))
-    throw std::runtime_error("Initialization replay requires enabled IMU and a positive cache limit");
-  limit_ = size_t(initialization_replay_max_mb) * 1024 * 1024;
+  bool replay_enabled;
+  nh.param<bool>("imu/initialization_replay",replay_enabled,false);
+  if (!replay_enabled) return;
+  int maximum_mb;
+  std::string phase;
+  nh.param<int>("imu/initialization_replay_max_mb",maximum_mb,2048);
+  nh.param<std::string>("imu/initialization_replay_phase",phase,"");
+  nh.param<std::string>("imu/initialization_checkpoint",checkpoint_,"");
+  nh.param<std::string>("imu/initialization_identity",identity_,"");
+  if (!imu_en || maximum_mb<=0 || (phase!="prepare" && phase!="run") || checkpoint_.empty() || identity_.empty())
+    throw std::runtime_error("Two-pass initialization requires the offline export runner, enabled IMU and a positive cache budget");
+  phase_=phase=="prepare" ? Phase::Preparing : Phase::Replaying;
+  limit_=size_t(maximum_mb)*1024*1024;
 }
 
 void StartupReplay::initializeLog(const std::string &path)
 {
-  if (enabled_)
-  {
-    log_.open(path);
-    if (!log_) throw std::runtime_error("Cannot create initialization replay log");
-    log_ << "event,begin,end,groups,bytes\n" << std::flush;
-  }
+  if (!enabled()) return;
+  log_.open(path);
+  if (!log_) throw std::runtime_error("Cannot create initialization replay log");
+  log_ << "event,begin,end,groups,bytes\n" << std::flush;
+  input_log_.open(path.substr(0,path.find_last_of('/'))+"/initialization_inputs.csv");
+  if (!input_log_) throw std::runtime_error("Cannot create initialization input audit");
+  input_log_ << "index,begin,end,flag,points,images,fingerprint\n" << std::flush;
 }
 
-void StartupReplay::cacheImu(const sensor_msgs::Imu::ConstPtr &imu)
+void StartupReplay::retainImuForInitialization(const sensor_msgs::Imu::ConstPtr &imu)
 {
   if (!pending()) return;
-  if (bytes_ > limit_ - sizeof(sensor_msgs::Imu))
-    throw std::runtime_error("Initialization replay IMU cache limit exceeded");
-  imu_samples_.push_back(imu);
-  bytes_ += sizeof(sensor_msgs::Imu);
+  size_t bytes=sizeof(sensor_msgs::Imu)+imu->header.frame_id.size();
+  if (bytes>limit_ || bytes_>limit_-bytes) throw std::runtime_error("Initialization IMU/index budget exceeded");
+  imu_samples_.push_back(imu); bytes_+=bytes;
 }
 
-void StartupReplay::cacheMeasurement(const LidarMeasureGroup &group)
+StartupReplay::Index StartupReplay::index(const LidarMeasureGroup &group) const
 {
-  if (!pending()) return;
-  size_t bytes = sizeof(LidarMeasureGroup);
-  for (const auto &cloud : {group.lidar, group.pcl_proc_cur, group.pcl_proc_next})
-    if (cloud) bytes += cloud->size() * sizeof(PointType);
-  for (const auto &m : group.measures)
+  const auto &m=group.measures.back();
+  Index result{group.last_lio_update_time,group.lio_vio_flg==LIO?m.lio_time:m.vio_time,
+      1469598103934665603ULL,group.pcl_proc_cur->size(),m.images.size(),int(group.lio_vio_flg)};
+  auto append=[&](const void *p,size_t n){result.fingerprint=flivo_trace::hashBytes(p,n,result.fingerprint);};
+  append(&result.flag,sizeof(result.flag)); append(&result.begin,sizeof(result.begin)); append(&result.end,sizeof(result.end));
+  for (const auto &p : group.pcl_proc_cur->points)
+  { const float values[]={p.x,p.y,p.z,p.intensity,p.curvature}; append(values,sizeof(values)); }
+  for (const auto &imu : m.imu)
   {
-    bytes += m.imu.size() * sizeof(sensor_msgs::Imu);
-    for (const auto &image : m.images) bytes += image.pixels.total() * image.pixels.elemSize();
+    std::vector<uint8_t> data(ros::serialization::serializationLength(*imu));
+    ros::serialization::OStream stream(data.data(),data.size()); ros::serialization::serialize(stream,*imu);
+    append(data.data(),data.size());
   }
-  if (bytes > limit_ || bytes_ > limit_ - bytes)
-    throw std::runtime_error("Initialization replay cache limit exceeded; no startup data was silently discarded");
-  LidarMeasureGroup saved = group;
-  if (group.lidar) saved.lidar.reset(new PointCloudXYZI(*group.lidar));
-  if (group.pcl_proc_cur) saved.pcl_proc_cur.reset(new PointCloudXYZI(*group.pcl_proc_cur));
-  if (group.pcl_proc_next) saved.pcl_proc_next.reset(new PointCloudXYZI(*group.pcl_proc_next));
-  for (auto &m : saved.measures) m.cloneImages();
-  measurements_.push_back(std::move(saved));
-  bytes_ += bytes;
+  for (const auto &image : m.images)
+  {
+    append(&image.camera_index,sizeof(image.camera_index)); append(&image.timestamp_ns,sizeof(image.timestamp_ns));
+    append(&image.timestamp,sizeof(image.timestamp));
+    const int shape[]={image.pixels.rows,image.pixels.cols,image.pixels.type()}; append(shape,sizeof(shape));
+    for (int row=0;row<image.pixels.rows;++row) append(image.pixels.ptr(row),image.pixels.cols*image.pixels.elemSize());
+  }
+  return result;
 }
 
-void StartupReplay::replay(LIVMapper &mapper)
+void StartupReplay::observeMeasurement(const LidarMeasureGroup &group)
 {
-  if (measurements_.empty()) throw std::runtime_error("Empty initialization replay cache");
-  // Keep synchronization's live pending scan/image state separate from replay.
-  LidarMeasureGroup live = mapper.LidarMeasures;
-  const double begin = measurements_.front().last_lio_update_time;
-  const double end = live.last_lio_update_time;
-  std::map<uint64_t, sensor_msgs::Imu::ConstPtr> ordered;
-  // Include IMU received before the first LiDAR and samples omitted by slicing.
+  if (!pending() && !replaying()) return;
+  const Index current=index(group);
+  if (pending())
+  {
+    if (indices_.empty()) begin_=current.begin;
+    if (bytes_>limit_-sizeof(Index)) throw std::runtime_error("Initialization index budget exceeded");
+    indices_.push_back(current); bytes_+=sizeof(Index);
+    log_ << std::setprecision(17) << "index," << current.begin << ',' << current.end << ','
+         << indices_.size() << ',' << bytes_ << '\n' << std::flush;
+  }
+  else
+  {
+    const auto &expected=indices_.at(verified_);
+    if (current.begin!=expected.begin || current.end!=expected.end || current.flag!=expected.flag ||
+        current.points!=expected.points || current.images!=expected.images || current.fingerprint!=expected.fingerprint)
+    {
+      std::ostringstream detail;
+      detail << std::setprecision(17) << "Initialization reread input mismatch at group " << verified_+1
+             << "; origin expected=" << expected.begin << " actual=" << current.begin
+             << "; end expected=" << expected.end << " actual=" << current.end
+             << "; points expected=" << expected.points << " actual=" << current.points
+             << "; images expected=" << expected.images << " actual=" << current.images
+             << "; hash expected=" << expected.fingerprint << " actual=" << current.fingerprint;
+      throw std::runtime_error(detail.str());
+    }
+  }
+  input_log_ << std::setprecision(17) << (pending()?indices_.size():verified_+1) << ','
+             << current.begin << ',' << current.end << ',' << current.flag << ','
+             << current.points << ',' << current.images << ',' << current.fingerprint << '\n' << std::flush;
+}
+
+void StartupReplay::prepareNextInput(LidarMeasureGroup &group) const
+{
+  // Initialization can leave the synchronization cursor unchanged when the
+  // leading slice has no IMU. The restored estimator already integrates such
+  // a slice, so reproduce the recorded slicing origin independently of its
+  // updated state. This changes no IMU integration history or EKF state.
+  if (replaying())
+    group.last_lio_update_time=indices_[verified_].begin;
+}
+
+void StartupReplay::afterUpdate(LIVMapper &mapper)
+{
+  if (replaying())
+  {
+    ++verified_;
+    log_ << std::setprecision(17) << "group," << mapper.LidarMeasures.lidar_frame_beg_time << ','
+         << mapper.LidarMeasures.last_lio_update_time << ',' << verified_ << ",0\n";
+    if (verified_==indices_.size())
+    {
+      log_ << "complete," << begin_ << ',' << end_ << ',' << indices_.size() << ',' << bytes_ << '\n' << std::flush;
+      phase_=Phase::Complete;
+    }
+    return;
+  }
+  if (!pending() || mapper.p_imu->imu_need_init) return;
+  end_=mapper.LidarMeasures.last_lio_update_time;
+  std::map<uint64_t,sensor_msgs::Imu::ConstPtr> ordered;
   for (const auto &imu : imu_samples_)
-    if (imu->header.stamp.toSec() <= end) ordered.emplace(imu->header.stamp.toNSec(), imu);
-  for (const auto &group : measurements_)
-    for (const auto &m : group.measures)
-      for (const auto &imu : m.imu) ordered.emplace(imu->header.stamp.toNSec(), imu);
-  deque<sensor_msgs::Imu::ConstPtr> samples;
+    if (imu->header.stamp.toSec()<=end_) ordered.emplace(imu->header.stamp.toNSec(),imu);
+  std::deque<sensor_msgs::Imu::ConstPtr> samples;
   for (const auto &item : ordered)
-  {
-    if (item.second->header.stamp.toSec() <= begin) samples.clear();
-    samples.push_back(item.second);
-  }
-  mapper.p_imu->rewindForStartupReplay(mapper._state, end, begin, samples);
-  mapper.vio_manager->clearStartupMap();
-  for (auto &item : mapper.voxelmap_manager->voxel_map_) delete item.second;
-  mapper.voxelmap_manager->voxel_map_.clear(); mapper.voxelmap_manager->ptpl_list_.clear();
-  mapper.voxelmap_manager->pv_list_.clear(); mapper._pv_list.clear();
-  mapper.voxelmap_manager->last_slide_position = mapper._state.pos_end;
-  mapper.lidar_map_inited = false;
-  for (auto &cloud : {mapper.feats_undistort, mapper.feats_down_body, mapper.feats_down_world,
-      mapper.pcl_w_wait_pub, mapper.pcl_b_wait_pub, mapper.pcl_wait_pub, mapper.pcl_b_wait_color}) cloud->clear();
-  mapper.pcl_wait_save->clear(); mapper.pcl_wait_save_intensity->clear();
-  mapper.path.poses.clear();
-  replay_started_ = true;
-  replaying_ = true;
-  log_ << std::setprecision(17) << "begin," << begin << ',' << end << ','
-      << measurements_.size() << ',' << bytes_ << '\n' << std::flush;
-  ROS_WARN("[startup replay] replaying %zu groups from %.9f to %.9f; cache %.1f MiB",
-      measurements_.size(), begin, end, bytes_ / 1048576.);
-  size_t count = 0;
-  while (!measurements_.empty())
-  {
-    mapper.LidarMeasures = std::move(measurements_.front());
-    measurements_.pop_front();
-    mapper.processImu();
-    mapper.stateEstimationAndMapping();
-    ++count;
-    log_ << std::setprecision(17) << "group,"
-        << mapper.LidarMeasures.lidar_frame_beg_time << ',' << mapper.LidarMeasures.last_lio_update_time
-        << ',' << count << ",0\n";
-  }
-  mapper.LidarMeasures = live;
-  replaying_ = false;
-  log_ << std::setprecision(17) << "complete," << begin << ',' << end
-      << ',' << count << ',' << bytes_ << '\n' << std::flush;
-  bytes_ = 0;
+  { if (item.second->header.stamp.toSec()<=begin_) samples.clear(); samples.push_back(item.second); }
+  mapper.p_imu->rewindForStartupReplay(mapper._state,end_,begin_,samples);
+  std::ostringstream out;
+  out << std::setprecision(17) << std::quoted(identity_) << '\n' << begin_ << ' ' << end_ << ' '
+      << indices_.size() << ' ' << bytes_ << ' ' << mapper.gravity_align_finished << '\n';
+  initialization_checkpoint::writeState(out,mapper._state);
+  mapper.p_imu->writeInitialization(out);
+  for (const auto &i : indices_) out << i.begin << ' ' << i.end << ' ' << i.fingerprint << ' ' << i.points << ' ' << i.images << ' ' << i.flag << '\n';
+  const auto payload=out.str(); const auto temporary=checkpoint_+".tmp";
+  { std::ofstream file(temporary,std::ios::binary);
+    file << "FLIVO_INITIALIZATION_V1\n" << payload.size() << ' ' << initialization_checkpoint::hash(payload) << '\n' << payload;
+    file.flush(); if (!file) throw std::runtime_error("Cannot write initialization checkpoint"); }
+  if (std::rename(temporary.c_str(),checkpoint_.c_str())) throw std::runtime_error("Cannot commit initialization checkpoint");
+  log_ << "prepared," << begin_ << ',' << end_ << ',' << indices_.size() << ',' << bytes_ << '\n' << std::flush;
+  phase_=Phase::Prepared;
+  ROS_WARN("[initialization] checkpoint ready: %zu indices, %zu IMU samples, %.3f MiB retained, no point/image payload cache",
+      indices_.size(),imu_samples_.size(),bytes_/1048576.);
   imu_samples_.clear();
+}
+
+void StartupReplay::restore(LIVMapper &mapper)
+{
+  if (!replaying()) return;
+  std::ifstream file(checkpoint_,std::ios::binary); std::string magic; size_t length=0; uint64_t checksum=0;
+  std::getline(file,magic);
+  if (magic!="FLIVO_INITIALIZATION_V1" || !(file >> length >> checksum) || length==0 || length>64*1024*1024 || file.get()!='\n')
+    throw std::runtime_error("Invalid initialization checkpoint header");
+  std::string payload(length,'\0');file.read(&payload[0],length);
+  if (size_t(file.gcount())!=length || file.peek()!=EOF || initialization_checkpoint::hash(payload)!=checksum)
+    throw std::runtime_error("Truncated or corrupt initialization checkpoint");
+  std::istringstream in(payload);std::string identity; size_t count=0;
+  if (!(in >> std::quoted(identity)) || identity!=identity_ ||
+      !(in >> begin_ >> end_ >> count >> bytes_ >> mapper.gravity_align_finished) ||
+      !std::isfinite(begin_) || !std::isfinite(end_) || end_<begin_ || count==0 || count>1000000)
+    throw std::runtime_error("Initialization checkpoint input/config/runtime identity mismatch");
+  initialization_checkpoint::readState(in,mapper._state);
+  mapper.p_imu->readInitialization(in);
+  indices_.resize(count);
+  for (auto &i : indices_)
+    if (!(in >> i.begin >> i.end >> i.fingerprint >> i.points >> i.images >> i.flag))
+      throw std::runtime_error("Invalid initialization input index");
+  in >> std::ws;if (!in.eof()) throw std::runtime_error("Trailing initialization checkpoint data");
+  mapper.state_propagat=mapper._state; mapper.voxelmap_manager->state_=mapper._state;
+  log_ << std::setprecision(17) << "begin," << begin_ << ',' << end_ << ',' << indices_.size() << ',' << bytes_ << '\n' << std::flush;
+  ROS_WARN("[initialization] restored start state at %.9f; verifying %zu reread input groups",begin_,indices_.size());
 }
 
 void StartupReplay::finish()
 {
   log_.flush();
-  if (pending() && !measurements_.empty())
-    throw std::runtime_error("Recording ended before IMU initialization; startup replay is incomplete");
+  input_log_.flush();
+  if (pending() || replaying())
+    throw std::runtime_error("Initialization preparation/reread did not complete");
 }

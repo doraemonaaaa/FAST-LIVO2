@@ -12,7 +12,33 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 #include "state_numerics.h"
+#include "replay/initialization_checkpoint.h"
 #include <stdexcept>
+
+void ImuProcess::writeInitialization(std::ostream &out) const
+{
+  using namespace initialization_checkpoint;
+  if (imu_need_init || !last_imu) throw std::runtime_error("Cannot checkpoint uninitialized IMU");
+  out << std::setprecision(17) << IMU_mean_acc_norm << ' ' << cov_inv_expo << ' '
+      << last_prop_end_time << ' ' << first_lidar_time << ' ' << imu_time_init << '\n';
+  for (const auto *v : {&cov_acc,&cov_gyr,&cov_bias_acc,&cov_bias_gyr,
+                        &mean_acc,&mean_gyr,&angvel_last,&acc_s_last}) writeMatrix(out,*v);
+  writeImu(out,*last_imu);
+}
+
+void ImuProcess::readInitialization(std::istream &in)
+{
+  using namespace initialization_checkpoint;
+  if (!(in >> IMU_mean_acc_norm >> cov_inv_expo >> last_prop_end_time >> first_lidar_time >> imu_time_init)
+      || !std::isfinite(IMU_mean_acc_norm) || IMU_mean_acc_norm<=0 || !std::isfinite(cov_inv_expo)
+      || !std::isfinite(last_prop_end_time) || !std::isfinite(first_lidar_time))
+    throw std::runtime_error("Invalid initialization checkpoint IMU parameters");
+  for (auto *v : {&cov_acc,&cov_gyr,&cov_bias_acc,&cov_bias_gyr,
+                  &mean_acc,&mean_gyr,&angvel_last,&acc_s_last}) readMatrix(in,*v);
+  last_imu=readImu(in);
+  pcl_wait_proc.clear(); IMUpose.clear(); cur_pcl_un_->clear();
+  imu_need_init=false;
+}
 
 void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double begin,
     const deque<sensor_msgs::Imu::ConstPtr> &samples)

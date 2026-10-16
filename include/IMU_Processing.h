@@ -52,6 +52,8 @@ public:
   void UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
   void rewindForStartupReplay(StatesGroup &state, double end, double begin,
       const deque<sensor_msgs::Imu::ConstPtr> &samples);
+  void writeInitialization(std::ostream &out) const;
+  void readInitialization(std::istream &in);
 
   ofstream fout_imu;
   double IMU_mean_acc_norm;
