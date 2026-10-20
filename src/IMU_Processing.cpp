@@ -570,11 +570,13 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       auto head = it_kp - 1;
       auto tail = it_kp;
       R_imu << MAT_FROM_ARRAY(head->rot);
-      acc_imu << VEC_FROM_ARRAY(head->acc);
+      // The tail stores the rate and world acceleration used to propagate
+      // this head-to-tail interval; pose and velocity start at the head.
+      acc_imu << VEC_FROM_ARRAY(tail->acc);
       // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
       vel_imu << VEC_FROM_ARRAY(head->vel);
       pos_imu << VEC_FROM_ARRAY(head->pos);
-      angvel_avr << VEC_FROM_ARRAY(head->gyr);
+      angvel_avr << VEC_FROM_ARRAY(tail->gyr);
 
       // printf("head->offset_time: %lf \n", head->offset_time);
       // printf("it_pcl->curvature: %lf pt dt: %lf \n", it_pcl->curvature,
