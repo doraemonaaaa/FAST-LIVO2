@@ -7,17 +7,20 @@
 #include <Eigen/Eigenvalues>
 #include <deque>
 
-// Short-window, attitude-aided LiDAR translation bootstrap. No map/EKF feedback.
+// Short-window, attitude-aided LiDAR pose bootstrap. No map/EKF feedback.
 // Points and inertial increments are expressed in the first scan's IMU frame.
 class MotionInitializer {
 public:
+  using PoseMatrix = Eigen::Matrix<double,6,6>;
+  using PoseVector = Eigen::Matrix<double,6,1>;
   explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0)
       : timeout_fallback_(timeout_fallback), fallback_velocity_sigma_(std::max(1.0, velocity_sigma)) {}
   struct Result {
     bool ready=false, timeout_fallback=false;
     V3D velocity=V3D::Zero(), position=V3D::Zero(), gravity=V3D::Zero();
     M3D rotation=M3D::Identity(), velocity_cov=M3D::Identity();
-    double elapsed=0, match_ratio=0, residual=0, eigen_ratio=0, fit_error=0;
+    PoseMatrix pose_covariance=PoseMatrix::Identity();
+    double elapsed=0, match_ratio=0, residual=0, eigen_ratio=0, fit_error=0, rotation_correction=0;
   };
   struct Observation { double dt; V3D position, dp, dv; M3D information; };
   struct VelocityFit { bool valid=false; V3D initial=V3D::Zero(); M3D covariance=M3D::Identity(); double error=0; };
@@ -44,7 +47,12 @@ public:
       throw std::runtime_error("motion initialization: invalid IMU attitude");
     q.normalize();
     if(first_attempt<0)first_attempt=end;
-    if(start<0) { start=end; anchor=q; previous_time=end; previous_acc=V3D::Zero(); }
+    if(start<0) {
+      start=end; anchor=q; previous_time=end; last_scan_time=end;
+      last_sample={end,M3D::Identity(),V3D(m->linear_acceleration.x,m->linear_acceleration.y,m->linear_acceleration.z)};
+      if(!last_sample.acceleration.allFinite()) throw std::runtime_error("motion initialization: invalid acceleration");
+      previous_acc=last_sample.acceleration+anchor.conjugate()*V3D(0,0,-9.81);
+    }
     out.elapsed=end-start;
     if(end-first_attempt>10) {
       if(!timeout_fallback_)
@@ -55,9 +63,11 @@ public:
       out.velocity_cov=M3D::Identity()*fallback_velocity_sigma_*fallback_velocity_sigma_;
       return out;
     }
-    M3D R=(anchor.conjugate()*q).toRotationMatrix();
+    const M3D imu_rotation=(anchor.conjugate()*q).toRotationMatrix();
+    M3D R=last_rotation*last_imu_rotation.transpose()*imu_rotation;
     V3D gravity=anchor.conjugate()*V3D(0,0,-9.81);
-    // Integrate IMU acceleration at its own timestamps; do not use scan-rate acceleration.
+    // Retain only IMU samples since the last accepted pose. Their acceleration
+    // is integrated once the LiDAR endpoint rotation for this interval is known.
     for(const auto &im:imus) {
       double time=im->header.stamp.toSec(); if(time<=previous_time) continue;
       double dt=time-previous_time;
@@ -67,9 +77,12 @@ public:
         return update(scan,begin,end,imus,R_LI,t_LI);
       }
       Eigen::Quaterniond qi(im->orientation.w,im->orientation.x,im->orientation.y,im->orientation.z);
-      if(!qi.coeffs().allFinite() || std::abs(qi.norm()-1)>.01) throw std::runtime_error("motion initialization: invalid attitude in window");
-      V3D acc=(anchor.conjugate()*qi.normalized())*V3D(im->linear_acceleration.x,im->linear_acceleration.y,im->linear_acceleration.z)+gravity;
-      V3D av=.5*(previous_acc+acc); dp+=dv*dt+.5*av*dt*dt; dv+=av*dt; previous_acc=acc;previous_time=time;
+      if(im->orientation_covariance[0]<0 || !qi.coeffs().allFinite() || std::abs(qi.norm()-1)>.01)
+        throw std::runtime_error("motion initialization: invalid attitude in window");
+      const V3D acceleration(im->linear_acceleration.x,im->linear_acceleration.y,im->linear_acceleration.z);
+      if(!acceleration.allFinite()) throw std::runtime_error("motion initialization: invalid acceleration");
+      pending_imus.push_back({time,(anchor.conjugate()*qi.normalized()).toRotationMatrix(),acceleration});
+      previous_time=time;
     }
     // End-of-scan attitude, rotational deskew, and the latest independent velocity estimate.
     V3D omega(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z);
@@ -79,46 +92,69 @@ public:
       double dt=end-(begin+double(pt.curvature)*.001);
       if(dt<-.01 || dt>.3) continue;
       V3D w=-omega*dt; double angle=w.norm();M3D dR=M3D::Identity();if(angle>1e-10)dR=Eigen::AngleAxisd(angle,w/angle).toRotationMatrix();
-      p=R*dR*(R_LI*p+t_LI)-velocity_guess*dt;
-      PointType v=pt;v.x=p.x();v.y=p.y();v.z=p.z();cloud->push_back(v);
+      p=dR*(R_LI*p+t_LI);
+      PointType v=pt;v.x=p.x();v.y=p.y();v.z=p.z();v.curvature=dt*1000.;cloud->push_back(v);
     }
     // Deterministic voxel centroids; avoid binary PCL/Eigen alignment dependencies.
-    std::map<std::array<int,3>,std::pair<V3D,int>> cells;
+    struct Cell { V3D sum=V3D::Zero(); double time=0; int count=0; };
+    std::map<std::array<int,3>,Cell> cells;
     for(const auto &p:*cloud) {
-      std::array<int,3> key{{int(std::floor(p.x/.25)),int(std::floor(p.y/.25)),int(std::floor(p.z/.25))}};
-      auto it=cells.find(key);
-      if(it==cells.end())it=cells.emplace(key,std::make_pair(V3D::Zero().eval(),0)).first;
-      it->second.first+=V3D(p.x,p.y,p.z);++it->second.second;
+      const V3D body(p.x,p.y,p.z), predicted=R*body-velocity_guess*(double(p.curvature)*.001);
+      std::array<int,3> key{{int(std::floor(predicted.x()/.25)),int(std::floor(predicted.y()/.25)),int(std::floor(predicted.z()/.25))}};
+      auto &cell=cells[key];cell.sum+=body;cell.time+=p.curvature;++cell.count;
     }
     PointCloudXYZI::Ptr reduced(new PointCloudXYZI());
-    for(const auto &cell:cells) {V3D q=cell.second.first/cell.second.second;PointType p;p.x=q.x();p.y=q.y();p.z=q.z();reduced->push_back(p);}
-    if(reduced->size()<100) return out;
+    for(const auto &entry:cells) {
+      const auto &cell=entry.second;V3D p=cell.sum/cell.count;
+      PointType v{};v.x=p.x();v.y=p.y();v.z=p.z();v.curvature=cell.time/cell.count;reduced->push_back(v);
+    }
+    if(reduced->size()<100) {
+      // Establish the anchor at the first usable reference scan. Otherwise a
+      // later body-frame target would be mistaken for the earlier anchor frame.
+      if(!target)resetWindow();
+      return out;
+    }
     if(!target) { target=reduced; buildGrid();buildNormals();return out; }
     V3D translation=last_translation+velocity_guess*(end-last_scan_time);
-    if(last_scan_time<0)translation.setZero();
-    M3D H=M3D::Zero();double rms=0;int count=0;
+    PoseMatrix H=PoseMatrix::Zero();double rms=0;int count=0;
     for(int iteration=0;iteration<20;++iteration) {
-      H.setZero();V3D gradient=V3D::Zero();double squared=0;count=0;
+      H.setZero();PoseVector gradient=PoseVector::Zero();double squared=0;count=0;
       for(const auto &pt:*reduced) {
-        V3D p=V3D(pt.x,pt.y,pt.z)+translation;PointType search;search.x=p.x();search.y=p.y();search.z=p.z();
+        const V3D body(pt.x,pt.y,pt.z);
+        V3D p=R*body-velocity_guess*(double(pt.curvature)*.001)+translation;
+        PointType search{};search.x=p.x();search.y=p.y();search.z=p.z();
         std::vector<int> ids(1);std::vector<float> distances(1);
         if(nearest(search,1,ids,distances)!=1 || distances[0]>.64 || normals[ids[0]].norm()<.5)continue;
         const V3D &n=normals[ids[0]];double r=n.dot(p-centers[ids[0]]);if(std::abs(r)>.3)continue;
         double weight=std::min(1.,.05/std::max(1e-9,std::abs(r)));
-        H+=weight*n*n.transpose();gradient+=weight*n*r;squared+=r*r;++count;
+        // Right rotation increment, world-frame translation increment.
+        PoseVector J;J.head<3>()=body.cross(R.transpose()*n);J.tail<3>()=n;
+        H+=weight*J*J.transpose();gradient+=weight*J*r;squared+=r*r;++count;
       }
       if(count<100)return out;
-      Eigen::SelfAdjointEigenSolver<M3D> es(H);out.eigen_ratio=es.eigenvalues().minCoeff()/es.eigenvalues().maxCoeff();
+      if((H.diagonal().array()<=1e-9).any())return out;
+      // Normalize rotation/translation units before checking six-DoF rank.
+      const PoseMatrix scale=H.diagonal().cwiseSqrt().cwiseInverse().asDiagonal();
+      Eigen::SelfAdjointEigenSolver<PoseMatrix> es(scale*H*scale);
+      out.eigen_ratio=es.eigenvalues().minCoeff()/es.eigenvalues().maxCoeff();
       if(out.eigen_ratio<.005)return out;
-      V3D step=-H.ldlt().solve(gradient);if(!step.allFinite() || step.norm()>.75)return out;
-      translation+=step;rms=std::sqrt(squared/count);if(step.norm()<1e-4)break;
+      PoseVector step=-H.ldlt().solve(gradient);
+      if(!step.allFinite() || step.head<3>().norm()>.2 || step.tail<3>().norm()>.75)return out;
+      R=R*Exp(V3D(step.head<3>()));translation+=step.tail<3>();
+      rms=std::sqrt(squared/count);
+      if(step.head<3>().norm()<1e-5 && step.tail<3>().norm()<1e-4)break;
     }
     out.match_ratio=double(count)/reduced->size();out.residual=rms;
     if(out.match_ratio<.20 || rms>.10)return out;
     // Use isotropic conservative per-scan registration noise with observed anisotropy.
-    M3D info=H/double(count)/(.03*.03);
+    out.pose_covariance=H.ldlt().solve(PoseMatrix::Identity())*(double(count)*.03*.03);
+    // Marginal translation covariance includes uncertainty coupled to rotation.
+    const M3D info=out.pose_covariance.bottomRightCorner<3,3>().inverse();
+    integrateAcceptedMotion(R,imu_rotation,gravity,end);
     observations.push_back({out.elapsed,translation,dp,dv,info});
-    last_translation=translation;last_scan_time=end;
+    last_translation=translation;last_scan_time=end;last_rotation=R;last_imu_rotation=imu_rotation;
+    out.position=translation;out.rotation=R;out.gravity=gravity;
+    out.rotation_correction=Log(M3D(imu_rotation.transpose()*R)).norm();
     if(out.elapsed>.15)velocity_guess=(translation-dp)/out.elapsed+dv;
     if(out.elapsed<.8)return out;
     auto fitted=fit(observations);out.fit_error=fitted.error;
@@ -128,6 +164,26 @@ public:
     return out;
   }
 private:
+  struct InertialSample { double time; M3D rotation; V3D acceleration; };
+  std::vector<InertialSample> pending_imus;
+  InertialSample last_sample{0,M3D::Identity(),V3D::Zero()};
+  M3D last_rotation=M3D::Identity(),last_imu_rotation=M3D::Identity();
+  void integrateAcceptedMotion(const M3D &rotation,const M3D &imu_rotation,const V3D &gravity,double end) {
+    const Eigen::Quaterniond first(last_rotation*last_imu_rotation.transpose());
+    const Eigen::Quaterniond last(rotation*imu_rotation.transpose());
+    double cursor=last_scan_time;
+    auto advance=[&](const InertialSample &sample,double time) {
+      if(time<=cursor)return;
+      const double alpha=std::max(0.,std::min(1.,(time-last_scan_time)/(end-last_scan_time)));
+      const V3D acc=first.slerp(alpha,last)*(sample.rotation*sample.acceleration)+gravity;
+      const double dt=time-cursor;const V3D average=.5*(previous_acc+acc);
+      dp+=dv*dt+.5*average*dt*dt;dv+=average*dt;
+      previous_acc=acc;cursor=time;
+    };
+    for(const auto &sample:pending_imus) {advance(sample,sample.time);last_sample=sample;}
+    // Match the LiDAR endpoint exactly using a final measurement hold.
+    advance(last_sample,end);pending_imus.clear();
+  }
   bool timeout_fallback_;
   double fallback_velocity_sigma_;
   void buildNormals() {
@@ -145,6 +201,7 @@ private:
   void resetWindow() {
     start=previous_time=last_scan_time=-1;target.reset();grid.clear();normals.clear();centers.clear();observations.clear();
     previous_acc.setZero();dp.setZero();dv.setZero();velocity_guess.setZero();last_translation.setZero();
+    pending_imus.clear();last_rotation.setIdentity();last_imu_rotation.setIdentity();
   }
   double first_attempt=-1,start=-1,previous_time=-1,last_scan_time=-1;
   Eigen::Quaterniond anchor=Eigen::Quaterniond::Identity();

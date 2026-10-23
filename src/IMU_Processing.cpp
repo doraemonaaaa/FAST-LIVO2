@@ -673,13 +673,14 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
           Lid_rot_to_IMU, Lid_offset_to_IMU);
       // Advance the slicing origin while startup scans are withheld from mapping.
       lidar_meas.last_lio_update_time = meas.lio_time;
-      ROS_INFO("[motion init] t=%.3f ratio=%.3f residual=%.4f eigen=%.5f fit=%.4f ready=%d",
-          r.elapsed,r.match_ratio,r.residual,r.eigen_ratio,r.fit_error,int(r.ready));
+      ROS_INFO("[motion init] t=%.3f ratio=%.3f residual=%.4f eigen=%.5f fit=%.4f rot_corr_rad=%.6f ready=%d",
+          r.elapsed,r.match_ratio,r.residual,r.eigen_ratio,r.fit_error,r.rotation_correction,int(r.ready));
       motion_ready = r.ready;
       if (r.ready)
       {
         stat.pos_end = r.position; stat.rot_end = r.rotation;
         stat.vel_end = r.velocity; stat.gravity = r.gravity;
+        if (!r.timeout_fallback) stat.cov.block<6,6>(0,0) = r.pose_covariance;
         stat.cov.block<3,3>(7,7) = r.velocity_cov;
         last_prop_end_time = meas.lio_time;
         acc_s_last = stat.rot_end * V3D(last_imu->linear_acceleration.x,
