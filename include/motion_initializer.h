@@ -1,5 +1,6 @@
 #pragma once
 #include "common_lib.h"
+#include "motion_gravity_fit.h"
 #include <map>
 #include <array>
 #include <unordered_map>
@@ -13,13 +14,18 @@ class MotionInitializer {
 public:
   using PoseMatrix = Eigen::Matrix<double,6,6>;
   using PoseVector = Eigen::Matrix<double,6,1>;
-  explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0)
-      : timeout_fallback_(timeout_fallback), fallback_velocity_sigma_(std::max(1.0, velocity_sigma)) {}
+  explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0, bool estimate_gravity=false)
+      : timeout_fallback_(timeout_fallback), fallback_velocity_sigma_(std::max(1.0, velocity_sigma)),
+        estimate_gravity_(estimate_gravity) {}
   struct Result {
     bool ready=false, timeout_fallback=false;
     V3D velocity=V3D::Zero(), position=V3D::Zero(), gravity=V3D::Zero();
     M3D rotation=M3D::Identity(), velocity_cov=M3D::Identity();
     PoseMatrix pose_covariance=PoseMatrix::Identity();
+    PoseMatrix velocity_gravity_covariance=PoseMatrix::Identity();
+    bool gravity_estimated=false;
+    double gravity_correction=0;
+    int gravity_stable_windows=0;
     double elapsed=0, match_ratio=0, residual=0, eigen_ratio=0, fit_error=0, rotation_correction=0;
   };
   struct Observation { double dt; V3D position, dp, dv; M3D information; };
@@ -157,6 +163,25 @@ public:
     out.rotation_correction=Log(M3D(imu_rotation.transpose()*R)).norm();
     if(out.elapsed>.15)velocity_guess=(translation-dp)/out.elapsed+dv;
     if(out.elapsed<.8)return out;
+    if(estimate_gravity_) {
+      const auto fitted=motion_initialization::fitGravity(observations,gravity,out.elapsed);
+      out.fit_error=fitted.error;
+      if(!fitted.valid) {gravity_stable_windows_=0;return out;}
+      const double change=last_fit_gravity_.norm()>0?
+          std::acos(std::max(-1.,std::min(1.,last_fit_gravity_.normalized().dot(fitted.gravity.normalized())))):1e100;
+      gravity_stable_windows_=change<.017453292519943295?gravity_stable_windows_+1:1;
+      last_fit_gravity_=fitted.gravity;
+      out.gravity_stable_windows=gravity_stable_windows_;
+      out.gravity_correction=std::acos(std::max(-1.,std::min(1.,gravity.normalized().dot(fitted.gravity.normalized()))));
+      out.gravity=fitted.gravity;
+      out.velocity=fitted.initial+dv+(fitted.gravity-gravity)*out.elapsed;
+      out.velocity_cov=fitted.covariance.topLeftCorner<3,3>();
+      out.velocity_gravity_covariance=fitted.covariance;
+      velocity_guess=out.velocity;
+      // Validate direction across three successively extended time windows.
+      out.ready=gravity_stable_windows_>=3;out.gravity_estimated=out.ready;
+      return out;
+    }
     auto fitted=fit(observations);out.fit_error=fitted.error;
     if(!fitted.valid)return out;
     out.ready=true;out.position=translation;out.velocity=fitted.initial+dv;
@@ -186,6 +211,9 @@ private:
   }
   bool timeout_fallback_;
   double fallback_velocity_sigma_;
+  bool estimate_gravity_;
+  int gravity_stable_windows_=0;
+  V3D last_fit_gravity_=V3D::Zero();
   void buildNormals() {
     normals.resize(target->size(),V3D::Zero());centers.resize(target->size(),V3D::Zero());
     for(size_t i=0;i<target->size();++i) {
@@ -202,6 +230,7 @@ private:
     start=previous_time=last_scan_time=-1;target.reset();grid.clear();normals.clear();centers.clear();observations.clear();
     previous_acc.setZero();dp.setZero();dv.setZero();velocity_guess.setZero();last_translation.setZero();
     pending_imus.clear();last_rotation.setIdentity();last_imu_rotation.setIdentity();
+    gravity_stable_windows_=0;last_fit_gravity_.setZero();
   }
   double first_attempt=-1,start=-1,previous_time=-1,last_scan_time=-1;
   Eigen::Quaterniond anchor=Eigen::Quaterniond::Identity();

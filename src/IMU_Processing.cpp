@@ -122,10 +122,11 @@ void ImuProcess::set_orientation_initialization(double acceleration_norm, double
 void ImuProcess::enable_motion_initialization()
 {
   if (!orientation_initialization) throw std::runtime_error("motion initialization requires IMU attitude");
-  bool timeout_fallback=false;
+  bool timeout_fallback=false, estimate_gravity=false;
   ros::NodeHandle nh;
   nh.param<bool>("imu/motion_initialization_timeout_fallback", timeout_fallback, false);
-  motion_initializer.reset(new MotionInitializer(timeout_fallback, initialization_velocity_sigma));
+  nh.param<bool>("imu/motion_initialization_estimate_gravity", estimate_gravity, false);
+  motion_initializer.reset(new MotionInitializer(timeout_fallback, initialization_velocity_sigma, estimate_gravity));
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
@@ -673,8 +674,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
           Lid_rot_to_IMU, Lid_offset_to_IMU);
       // Advance the slicing origin while startup scans are withheld from mapping.
       lidar_meas.last_lio_update_time = meas.lio_time;
-      ROS_INFO("[motion init] t=%.3f ratio=%.3f residual=%.4f eigen=%.5f fit=%.4f rot_corr_rad=%.6f ready=%d",
-          r.elapsed,r.match_ratio,r.residual,r.eigen_ratio,r.fit_error,r.rotation_correction,int(r.ready));
+      ROS_INFO("[motion init] t=%.3f ratio=%.3f residual=%.4f eigen=%.5f fit=%.4f rot_corr_rad=%.6f g_corr_rad=%.6f g_stable=%d ready=%d",
+          r.elapsed,r.match_ratio,r.residual,r.eigen_ratio,r.fit_error,r.rotation_correction,
+          r.gravity_correction,r.gravity_stable_windows,int(r.ready));
       motion_ready = r.ready;
       if (r.ready)
       {
@@ -682,6 +684,13 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
         stat.vel_end = r.velocity; stat.gravity = r.gravity;
         if (!r.timeout_fallback) stat.cov.block<6,6>(0,0) = r.pose_covariance;
         stat.cov.block<3,3>(7,7) = r.velocity_cov;
+        if(r.gravity_estimated) {
+          stat.cov.block<3,3>(16,16)=r.velocity_gravity_covariance.bottomRightCorner<3,3>();
+          stat.cov.block<3,3>(7,16)=r.velocity_gravity_covariance.topRightCorner<3,3>();
+          stat.cov.block<3,3>(16,7)=r.velocity_gravity_covariance.bottomLeftCorner<3,3>();
+          ROS_INFO("[motion init] estimated gravity %.9f %.9f %.9f m/s2; norm %.9f; direction correction %.6f deg",
+              r.gravity.x(),r.gravity.y(),r.gravity.z(),r.gravity.norm(),r.gravity_correction*180/M_PI);
+        }
         last_prop_end_time = meas.lio_time;
         acc_s_last = stat.rot_end * V3D(last_imu->linear_acceleration.x,
             last_imu->linear_acceleration.y,last_imu->linear_acceleration.z) + stat.gravity;
