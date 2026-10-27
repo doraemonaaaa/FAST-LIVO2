@@ -122,10 +122,10 @@ void ImuProcess::set_orientation_initialization(double acceleration_norm, double
 void ImuProcess::enable_motion_initialization()
 {
   if (!orientation_initialization) throw std::runtime_error("motion initialization requires IMU attitude");
-  bool timeout_fallback=false, estimate_gravity=false;
+  bool timeout_fallback=false, estimate_gravity=true;
   ros::NodeHandle nh;
   nh.param<bool>("imu/motion_initialization_timeout_fallback", timeout_fallback, false);
-  nh.param<bool>("imu/motion_initialization_estimate_gravity", estimate_gravity, false);
+  nh.param<bool>("imu/motion_initialization_estimate_gravity", estimate_gravity, true);
   motion_initializer.reset(new MotionInitializer(timeout_fallback, initialization_velocity_sigma, estimate_gravity));
 }
 

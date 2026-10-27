@@ -14,7 +14,7 @@ class MotionInitializer {
 public:
   using PoseMatrix = Eigen::Matrix<double,6,6>;
   using PoseVector = Eigen::Matrix<double,6,1>;
-  explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0, bool estimate_gravity=false)
+  explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0, bool estimate_gravity=true)
       : timeout_fallback_(timeout_fallback), fallback_velocity_sigma_(std::max(1.0, velocity_sigma)),
         estimate_gravity_(estimate_gravity) {}
   struct Result {
