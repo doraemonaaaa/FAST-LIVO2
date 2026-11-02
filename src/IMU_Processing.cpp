@@ -47,6 +47,8 @@ void ImuProcess::Reset()
   imu_need_init = true;
   init_iter_num = 1;
   IMUpose.clear();
+  motion_imu_carry.clear();
+  motion_point_carry.clear();motion_point_origin=-1;
   last_prop_end_time = 0.0;
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
@@ -639,7 +641,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // printf("[ IMU ] time forward: %lf, backward: %lf.\n", t1 - t0, omp_get_wtime() - t1);
 }
 
-void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_)
+void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_,bool initialization_slice)
 {
   double t1, t2, t3;
   t1 = omp_get_wtime();
@@ -658,20 +660,45 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     // lidar_meas.last_lio_update_time = pcl_end_time;
 
     cur_pcl_un_->clear();
-    if (meas.imu.empty()) { return; };
-    /// The very first lidar frame
-    IMU_init(meas, stat, init_iter_num);
-
+    if(motion_initializer && initialization_slice) {
+      if(motion_point_origin<0)motion_point_origin=lidar_meas.last_lio_update_time;
+      for(auto point:lidar_meas.pcl_proc_cur->points) {
+        point.curvature+=(lidar_meas.last_lio_update_time-motion_point_origin)*1000.;
+        motion_point_carry.push_back(point);
+      }
+    }
+    // Auxiliary events may have consumed every IMU sample before the anchor.
+    // Their retained samples still support the full motion-initialization scan.
+    if (meas.imu.empty() && !(motion_initializer && lidar_meas.lio_vio_flg==LIO && !motion_imu_carry.empty()))return;
+    if(!meas.imu.empty()) {
+      IMU_init(meas, stat, init_iter_num);
+      last_imu = meas.imu.back();
+    }
     imu_need_init = true;
 
-    last_imu = meas.imu.back();
-
     bool motion_ready = !motion_initializer;
+    if(motion_initializer && lidar_meas.lio_vio_flg==VIO)
+      motion_imu_carry.insert(motion_imu_carry.end(),meas.imu.begin(),meas.imu.end());
     if (motion_initializer && lidar_meas.lio_vio_flg == LIO)
     {
-      auto r = motion_initializer->update(*lidar_meas.pcl_proc_cur,
-          lidar_meas.last_lio_update_time, meas.lio_time, meas.imu,
+      auto motion_imus=std::move(motion_imu_carry);
+      motion_imu_carry.clear();
+      motion_imus.insert(motion_imus.end(),meas.imu.begin(),meas.imu.end());
+      PointCloudXYZI fit_cloud;
+      const PointCloudXYZI *fit_input=lidar_meas.pcl_proc_cur.get();
+      const double fit_begin=motion_point_origin<0?lidar_meas.last_lio_update_time:motion_point_origin;
+      if(motion_point_origin>=0) {
+        fit_cloud=motion_point_carry;
+        for(auto point:lidar_meas.pcl_proc_cur->points) {
+          point.curvature+=(lidar_meas.last_lio_update_time-fit_begin)*1000.;fit_cloud.push_back(point);
+        }
+        std::stable_sort(fit_cloud.points.begin(),fit_cloud.points.end(),[](const PointType &a,const PointType &b){return a.curvature<b.curvature;});
+        fit_input=&fit_cloud;
+      }
+      auto r = motion_initializer->update(*fit_input,
+          fit_begin, meas.lio_time, motion_imus,
           Lid_rot_to_IMU, Lid_offset_to_IMU);
+      motion_point_carry.clear();motion_point_origin=-1;
       // Advance the slicing origin while startup scans are withheld from mapping.
       lidar_meas.last_lio_update_time = meas.lio_time;
       ROS_INFO("[motion init] t=%.3f ratio=%.3f residual=%.4f eigen=%.5f fit=%.4f rot_corr_rad=%.6f g_corr_rad=%.6f g_stable=%d ready=%d",

@@ -1,5 +1,6 @@
 #include "LIVMapper.h"
 #include "camera_sync.h"
+#include "camera_events.h"
 #include <vikit/camera_loader.h>
 #include <regex>
 #include <filesystem>
@@ -26,8 +27,16 @@ void LIVMapper::configureCameras()
   nh.param<string>("anchor_camera", anchor, order.front());
   nh.param<double>("camera_sync/tolerance_s", vio_manager->sync_tolerance, 0.0001);
   nh.param<double>("camera_sync/maximum_lateness_s", camera_maximum_lateness, 0.5);
-  if (!(vio_manager->sync_tolerance >= 0 && vio_manager->sync_tolerance <= .005 &&
-        camera_maximum_lateness > 2 * vio_manager->sync_tolerance && camera_maximum_lateness < 2))
+  string update_mode;
+  nh.param<string>("camera_sync/update_mode",update_mode,"joint");
+  if(update_mode!="joint" && update_mode!="sequential")
+    throw std::runtime_error("camera_sync/update_mode must be joint or sequential");
+  sequential_camera_updates=update_mode=="sequential";
+  if(sequential_camera_updates && !imu_en)
+    throw std::runtime_error("Sequential camera updates require IMU propagation");
+  if (!(std::isfinite(camera_maximum_lateness) && camera_maximum_lateness>0 && camera_maximum_lateness<2) ||
+      (!sequential_camera_updates && !(vio_manager->sync_tolerance >= 0 && vio_manager->sync_tolerance <= .005 &&
+        camera_maximum_lateness > 2 * vio_manager->sync_tolerance)))
     throw std::runtime_error("Invalid synchronous camera tolerance/lateness");
   std::set<string> ids, topics;
   for (size_t k = 0; k < order.size(); ++k)
@@ -99,6 +108,15 @@ void LIVMapper::configureCameras()
   vio_manager->audit.open(string(ROOT_DIR) + "Log/camera_observations.csv");
   if (!vio_manager->audit) throw std::runtime_error("Cannot open camera observation audit");
   vio_manager->audit << "timestamp,camera,retrieved,used,inv_exposure,covariance_trace\n";
+  if(sequential_camera_updates) {
+    camera_events_log.open(string(ROOT_DIR)+"Log/camera_events.csv");
+    if(!camera_events_log)throw std::runtime_error("Cannot open camera event audit");
+    camera_events_log<<"begin,end,imu_samples,lidar_points,ready,position_x,position_y,position_z,covariance_trace\n";
+    camera_event_frames_log.open(string(ROOT_DIR)+"Log/camera_event_frames.jsonl");
+    camera_input_log.open(string(ROOT_DIR)+"Log/camera_input.csv");
+    if(!camera_event_frames_log || !camera_input_log)throw std::runtime_error("Cannot open asynchronous camera audit");
+    camera_input_log<<"camera,timestamp_ns,decision\n";
+  }
 }
 
 void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg, size_t camera_index)
@@ -109,14 +127,20 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg, size_t camera_ind
   if (hilti_en && ++queue.subsample_counter % 4 != 0) return;
   const double time = msg->header.stamp.toSec() + camera.time_offset + camera.exposure_time_offset;
   if (!std::isfinite(time)) throw std::runtime_error("Non-finite image time");
-  if (abs(time - queue.last_timestamp) < .001 || last_timestamp_lidar < 0) return;
+  const uint64_t stamp=msg->header.stamp.toNSec()+int64_t(std::llround((camera.time_offset+camera.exposure_time_offset)*1e9));
+  auto record=[&](const char *decision){if(camera_input_log)camera_input_log<<camera.id<<','<<stamp<<','<<decision<<'\n'<<std::flush;};
+  if(sequential_camera_updates) {
+    if(time==queue.last_timestamp){record("duplicate_time");return;}
+    if(stamp<last_camera_event_stamp){record("late");return;}
+  } else if (abs(time - queue.last_timestamp) < .001 || last_timestamp_lidar < 0) return;
   if (time < queue.last_timestamp) throw std::runtime_error("Image time went backwards: " + camera.id);
-  if (time - queue.last_timestamp < .02) return;
+  if (!sequential_camera_updates && time - queue.last_timestamp < .02) return;
   std::lock_guard<std::mutex> lock(mtx_buffer);
   queue.images.push_back(getImageFromMsg(msg));
   queue.times.push_back(time);
   queue.stamps.push_back(msg->header.stamp.toNSec() + int64_t(std::llround((camera.time_offset + camera.exposure_time_offset) * 1e9)));
   queue.last_timestamp = time;
+  record("queued");
   sig_buffer.notify_all();
 }
 
@@ -158,9 +182,12 @@ void LIVMapper::consumeImageBundle()
   pending_images.clear();
 }
 
-void LIVMapper::saveCameraImages(const string &stamp, double timestamp)
+void LIVMapper::saveCameraImages(const string &stamp, double timestamp, double bundle_time)
 {
-  camera_frames_log << "{\"timestamp_ns\":" << (std::stoll(stamp.substr(0, stamp.find('.'))) * 1000000000LL + std::stoll(stamp.substr(stamp.find('.') + 1)) * 1000)
+  std::ostringstream group_stamp;
+  group_stamp<<std::fixed<<std::setprecision(6)<<(bundle_time<0?timestamp:bundle_time);
+  const string key=bundle_time<0?stamp:group_stamp.str();
+  camera_frames_log << "{\"timestamp_ns\":" << (std::stoll(key.substr(0, key.find('.'))) * 1000000000LL + std::stoll(key.substr(key.find('.') + 1)) * 1000)
                     << ",\"images\":[";
   bool first = true;
   for (const auto &camera : vio_manager->cameras)
@@ -175,10 +202,34 @@ void LIVMapper::saveCameraImages(const string &stamp, double timestamp)
     first = false;
     camera_frames_log << std::setprecision(17) << "{\"camera_id\":\"" << camera->id
       << "\",\"timestamp_ns\":" << camera->image_timestamp_ns
-      << ",\"state_timestamp_ns\":" << int64_t(std::llround(timestamp * 1e9))
+      << ",\"state_timestamp_ns\":" << int64_t(std::llround(camera->state_timestamp * 1e9))
       << ",\"path\":\"raw/" << relative << "\",\"T_W_C\":{\"translation_m\":["
       << T_W_C.translation().x() << ',' << T_W_C.translation().y() << ',' << T_W_C.translation().z()
       << "],\"quaternion_xyzw\":[" << q.x() << ',' << q.y() << ',' << q.z() << ',' << q.w() << "]}}";
   }
   camera_frames_log << "]}\n" << std::flush;
+}
+
+void LIVMapper::saveCameraEvent()
+{
+  for(const auto &image:LidarMeasures.measures.back().images) {
+    auto &camera=*vio_manager->cameras.at(image.camera_index);
+    if(!camera.new_frame_)throw std::runtime_error("Camera event has no observation pose");
+    const bool anchor=image.camera_index==vio_manager->anchor_index;
+    std::ostringstream stamp;stamp<<std::fixed<<std::setprecision(anchor?6:9)<<image.timestamp;
+    const string path="image/"+(anchor?string():camera.id+"/")+stamp.str()+".png";
+    if(img_save_en && !std::filesystem::exists(string(ROOT_DIR)+"Log/"+path) &&
+        !cv::imwrite(string(ROOT_DIR)+"Log/"+path,camera.img_rgb))
+      throw std::runtime_error("Cannot save asynchronous camera image");
+    const auto &s=camera.observation_state;
+    const SE3 pose=camera.new_frame_->T_f_w_.inverse();
+    const Eigen::Quaterniond qc(pose.rotation_matrix()),qi(s.rot_end);
+    camera_event_frames_log<<std::setprecision(17)<<"{\"timestamp_ns\":"<<image.timestamp_ns
+      <<",\"camera_id\":\""<<camera.id<<"\",\"state_timestamp_ns\":"<<int64_t(std::llround(camera.state_timestamp*1e9))
+      <<",\"path\":\"raw/"<<path<<"\",\"image_saved\":"<<(img_save_en?"true":"false")
+      <<",\"T_W_C\":{\"translation_m\":["<<pose.translation().x()<<','<<pose.translation().y()<<','<<pose.translation().z()
+      <<"],\"quaternion_xyzw\":["<<qc.x()<<','<<qc.y()<<','<<qc.z()<<','<<qc.w()<<"]}"
+      <<",\"T_W_I\":{\"translation_m\":["<<s.pos_end.x()<<','<<s.pos_end.y()<<','<<s.pos_end.z()
+      <<"],\"quaternion_xyzw\":["<<qi.x()<<','<<qi.y()<<','<<qi.z()<<','<<qi.w()<<"]}}\n"<<std::flush;
+  }
 }

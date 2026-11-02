@@ -14,6 +14,7 @@ which is included as part of this source code package.
 #include "flivo_trace.h"
 #include "livo_time_cut.h"
 #include "camera_projection.h"
+#include "camera_events.h"
 #include <stdexcept>
 
 namespace flivo_trace
@@ -346,7 +347,24 @@ void LIVMapper::processImu()
   startup_replay.observeMeasurement(LidarMeasures);
   // double t0 = omp_get_wtime();
 
-  p_imu->Process2(LidarMeasures, _state, feats_undistort);
+  const double point_origin=LidarMeasures.last_lio_update_time;
+  if(!(bundle_sequential_updates && LidarMeasures.lio_vio_flg==VIO))
+    p_imu->Process2(LidarMeasures, _state, feats_undistort);
+  if(sequential_camera_updates && LidarMeasures.lio_vio_flg==LIO) {
+    if(!p_imu->imu_need_init && !startup_replay.pending() && !inter_camera_points.empty()) {
+      PointCloudXYZI combined;combined.reserve(inter_camera_points.size()+feats_undistort->size());
+      for(const auto &sample:inter_camera_points) {
+        PointType point=sample.point;
+        const V3D body=extR.transpose()*(_state.rot_end.transpose()*(sample.world-_state.pos_end)-extT);
+        point.x=body.x();point.y=body.y();point.z=body.z();
+        point.curvature=(sample.timestamp-point_origin)*1000.;combined.push_back(point);
+      }
+      combined+=*feats_undistort;
+      std::stable_sort(combined.begin(),combined.end(),[](const PointType &a,const PointType &b){return a.curvature<b.curvature;});
+      feats_undistort->swap(combined);
+    }
+    inter_camera_points.clear();
+  }
 
   if (gravity_align_en) gravityAlignment();
 
@@ -404,8 +422,11 @@ void LIVMapper::handleVIO()
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
             << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << std::endl;
     
-  if (pcl_w_wait_pub->empty() || (pcl_w_wait_pub == nullptr)) 
+  const bool supported=sequential_camera_updates ? !p_imu->imu_need_init : !pcl_w_wait_pub->empty();
+  if (!supported)
   {
+    if(bundle_sequential_updates)processSequentialVIO(false);
+    if(sequential_camera_updates)LidarMeasures.last_lio_update_time=LidarMeasures.measures.back().vio_time;
     std::cout << "[ VIO ] No point!!!" << std::endl;
     return;
   }
@@ -422,7 +443,9 @@ void LIVMapper::handleVIO()
   }
 
   flivo_trace::state("pre_vio", -1, _state);
-  vio_manager->processFrame(LidarMeasures.measures.back().images, _pv_list, voxelmap_manager->voxel_map_);
+  if(bundle_sequential_updates)processSequentialVIO(true);
+  else vio_manager->processFrame(LidarMeasures.measures.back().images, _pv_list,
+      voxelmap_manager->voxel_map_,LidarMeasures.measures.back().vio_time);
   flivo_trace::state("post_vio", -1, _state);
 
   if (imu_prop_enable)
@@ -445,7 +468,12 @@ void LIVMapper::handleVIO()
   //   visual_sub_map->push_back(temp_map);
   // }
 
-  publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  if(!sequential_camera_updates || sequential_anchor_event)
+    publish_frame_world(pubLaserCloudFullRes, vio_manager);
+  if(sequential_camera_updates) {
+    LidarMeasures.last_lio_update_time=LidarMeasures.measures.back().vio_time;
+    if(!startup_replay.pending())saveCameraEvent();
+  }
   if (!startup_replay.pending()) publish_img_rgb(pubImage, vio_manager);
 
   euler_cur = RotMtoEuler(_state.rot_end);
@@ -966,9 +994,13 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
-  if (lid_raw_data_buffer.empty() && lidar_en) return false;
+  if(slam_mode_==LIVO && sequential_camera_updates)return syncCameraEvent(meas);
+  // A selected bundle has already passed sensor coverage checks. Complete its
+  // VIO even if consuming LIO emptied a queue at EOF, in either update mode.
+  const bool finishing_bundle=slam_mode_==LIVO && meas.lio_vio_flg==LIO;
+  if (lid_raw_data_buffer.empty() && lidar_en && !finishing_bundle) return false;
   if (imageBuffer().empty() && img_en) return false;
-  if (imu_buffer.empty() && imu_en) return false;
+  if (imu_buffer.empty() && imu_en && !finishing_bundle) return false;
 
   switch (slam_mode_)
   {
@@ -1063,67 +1095,10 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       }
 
       if (!prepareImageBundle(img_capture_time)) return false;
+      bundle_sequential_updates=false;
 
-      struct MeasureGroup m;
-
-      // printf("[ Data Cut ] LIO \n");
-      // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
-      m.imu.clear();
-      m.lio_time = img_capture_time;
-      mtx_buffer.lock();
-      while (!imu_buffer.empty())
-      {
-        if (imu_buffer.front()->header.stamp.toSec() > m.lio_time) break;
-
-        if (imu_buffer.front()->header.stamp.toSec() > meas.last_lio_update_time) m.imu.push_back(imu_buffer.front());
-
-        imu_buffer.pop_front();
-        // printf("[ Data Cut ] imu time: %lf \n",
-        // imu_buffer.front()->header.stamp.toSec());
-      }
-      mtx_buffer.unlock();
-      sig_buffer.notify_all();
-
-      splitPendingPointsAtImageTime(meas.pcl_proc_next->points, meas.pcl_proc_cur->points,
-                                   (img_capture_time - meas.last_lio_update_time) * 1000.0);
-
-      int lid_frame_num = lid_raw_data_buffer.size();
-      int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;
-      meas.pcl_proc_cur->reserve(max_size);
-      meas.pcl_proc_next->reserve(max_size);
-      // deque<PointCloudXYZI::Ptr> lidar_buffer_tmp;
-
-      while (!lid_raw_data_buffer.empty())
-      {
-        if (lid_header_time_buffer.front() > img_capture_time) break;
-        auto pcl(lid_raw_data_buffer.front()->points);
-        double frame_header_time(lid_header_time_buffer.front());
-        float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
-
-        for (int i = 0; i < pcl.size(); i++)
-        {
-          auto pt = pcl[i];
-          if (pcl[i].curvature < max_offs_time_ms)
-          {
-            pt.curvature += (frame_header_time - meas.last_lio_update_time) * 1000.0f;
-            meas.pcl_proc_cur->points.push_back(pt);
-          }
-          else
-          {
-            pt.curvature += (frame_header_time - m.lio_time) * 1000.0f;
-            meas.pcl_proc_next->points.push_back(pt);
-          }
-        }
-        lid_raw_data_buffer.pop_front();
-        lid_header_time_buffer.pop_front();
-      }
-
-      // Individually sorted scans can overlap in time. Deskew requires the
-      // combined current cloud to be sorted as well.
-      std::stable_sort(meas.pcl_proc_cur->points.begin(), meas.pcl_proc_cur->points.end(),
-                       [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
-      std::stable_sort(meas.pcl_proc_next->points.begin(), meas.pcl_proc_next->points.end(),
-                       [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
+      MeasureGroup m=collectLivoSlice(meas,img_capture_time);
+      bundle_lio_time=m.lio_time;
 
       meas.measures.push_back(m);
       meas.lio_vio_flg = LIO;
@@ -1141,7 +1116,6 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       meas.lio_vio_flg = VIO;
       // printf("[ Data Cut ] VIO \n");
       meas.measures.clear();
-      double imu_time = imu_buffer.front()->header.stamp.toSec();
 
       struct MeasureGroup m;
       m.vio_time = img_capture_time;
@@ -1273,7 +1247,9 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
         V2D pc;
         for (auto &camera : vio_manager->cameras)
         {
-          if (!camera->active || !camera->new_frame_) continue;
+          if ((!camera->active && !sequential_camera_updates) || !camera->new_frame_) continue;
+          if(sequential_camera_updates &&
+              LidarMeasures.measures.back().vio_time-camera->image_timestamp>camera_maximum_lateness)continue;
           V3D ray = camera->new_frame_->w2f(p_w);
           if (!flivo::validProjectionRay(ray)) continue;
           V2D px = camera->new_frame_->w2c(p_w);
@@ -1328,7 +1304,8 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
       && LidarMeasures.lio_vio_flg == VIO)
   {
     std::stringstream rgb_time;
-    rgb_time << std::fixed << std::setprecision(6) << LidarMeasures.last_lio_update_time;
+    rgb_time << std::fixed << std::setprecision(6) <<
+        (bundle_sequential_updates?LidarMeasures.measures.back().lio_time:LidarMeasures.last_lio_update_time);
     const std::string rgb_path = std::string(ROOT_DIR) + "Log/pcd_rgb/" + rgb_time.str() + ".pcd";
     if (laserCloudBodyRGB->empty())
     {
@@ -1349,7 +1326,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   /* 2. noted that pcd save will influence the real-time performences **/
   double update_time = 0.0;
   if (LidarMeasures.lio_vio_flg == VIO) {
-    update_time = LidarMeasures.measures.back().vio_time;
+    update_time = bundle_sequential_updates?LidarMeasures.measures.back().lio_time:LidarMeasures.measures.back().vio_time;
   } else { // LIO / LO
     update_time = LidarMeasures.measures.back().lio_time;
   }
@@ -1425,11 +1402,15 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 
     if (img_save_interval > 0 && img_wait_num >= img_save_interval)
     {
-      saveCameraImages(ss_time.str(), LidarMeasures.measures.back().vio_time);
+      const auto &anchor=vio_manager->anchor();
+      const double image_time=bundle_sequential_updates?anchor.image_timestamp:LidarMeasures.measures.back().vio_time;
+      const StatesGroup &image_state=bundle_sequential_updates?anchor.observation_state:_state;
+      std::ostringstream image_stamp;image_stamp<<std::fixed<<std::setprecision(6)<<image_time;
+      saveCameraImages(image_stamp.str(),image_time,bundle_sequential_updates?update_time:-1);
       
-      Eigen::Quaterniond q(_state.rot_end);
+      Eigen::Quaterniond q(image_state.rot_end);
       fout_visual_pos << std::fixed << std::setprecision(9);
-      fout_visual_pos << LidarMeasures.measures.back().vio_time << std::setprecision(17) << " " << _state.pos_end[0] << " " << _state.pos_end[1] << " " << _state.pos_end[2] << " "
+      fout_visual_pos << image_time << std::setprecision(17) << " " << image_state.pos_end[0] << " " << image_state.pos_end[1] << " " << image_state.pos_end[2] << " "
             << q.x() << " " << q.y() << " " << q.z() << " " << q.w() << std::endl;
       img_wait_num = 0;
     }

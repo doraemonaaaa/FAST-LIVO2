@@ -48,7 +48,7 @@ public:
   void disable_gravity_est();
   void disable_bias_est();
   void disable_exposure_est();
-  void Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_);
+  void Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_,bool initialization_slice=false);
   void UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
   void rewindForStartupReplay(StatesGroup &state, double end, double begin,
       const deque<sensor_msgs::Imu::ConstPtr> &samples);
@@ -93,6 +93,9 @@ private:
   bool ba_bg_est_en = true;
   bool exposure_estimate_en = true;
   std::unique_ptr<MotionInitializer> motion_initializer;
+  deque<sensor_msgs::Imu::ConstPtr> motion_imu_carry;
+  PointCloudXYZI motion_point_carry;
+  double motion_point_origin=-1;
   bool orientation_initialization = false;
   double initialization_acceleration_norm = 0;
   double initialization_velocity_sigma = 0;

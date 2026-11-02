@@ -18,6 +18,7 @@ which is included as part of this source code package.
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
+#include <functional>
 #include <vikit/math_utils.h>
 #include <vikit/robust_cost.h>
 #include <vikit/vision.h>
@@ -92,6 +93,8 @@ public:
   string id, topic;
   double time_offset = 0, exposure_time_offset = 0, image_timestamp = 0;
   uint64_t image_timestamp_ns = 0;
+  double state_timestamp = 0;
+  StatesGroup observation_state;
   int max_observations = 0;
   bool active = false;
   cv::Mat gray;
@@ -213,7 +216,8 @@ public:
   VisualCamera &anchor() { return *cameras.at(anchor_index); }
   void clearStartupMap();
   void processFrame(const vector<MeasureGroup::Image> &images, vector<pointWithVar> &pg,
-                    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map);
+                    const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map,
+                    double reference_time=0,const std::function<void(double)> &advance={});
   void computeJacobianAndUpdateEKF();
 };
 typedef std::shared_ptr<VIOManager> VIOManagerPtr;

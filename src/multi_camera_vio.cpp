@@ -1,6 +1,7 @@
 /* Parameterized visual observations and one joint iterated EKF update. */
 #include "vio.h"
 #include "state_numerics.h"
+#include "camera_events.h"
 #include <unordered_set>
 #include <stdexcept>
 #include <iomanip>
@@ -19,46 +20,57 @@ void VIOManager::clearStartupMap()
 }
 
 void VIOManager::processFrame(const vector<MeasureGroup::Image> &images,
-    vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map)
+    vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map,
+    double reference_time,const std::function<void(double)> &advance)
 {
-  for (auto &camera : cameras) camera->active = false;
-  for (const auto &image : images)
-  {
-    auto &camera = *cameras.at(image.camera_index);
-    if (camera.active) throw std::runtime_error("Duplicate camera in image bundle");
-    camera.active = true;
-    camera.prepareFrame(image, pg, map);
-  }
-  // One geometric point contributes through one camera per bundle. This avoids
-  // counting its shared depth/normal uncertainty as independent information.
-  // Selection is deterministic, in configured camera priority order.
   std::unordered_set<VisualPoint *> claimed;
-  for (auto &camera : cameras)
-    if (camera->active)
-      for (int i = 0; i < camera->total_points; ++i)
-        if (!claimed.insert(camera->visual_submap->voxel_points[i]).second)
-          camera->noise_weights[i] = 0;
   static const bool skip_visual = [] {
     const char *v = std::getenv("FLIVO_DIAGNOSTIC_SKIP_VISUAL");
     return v && string(v) == "1";
   }();
-  if (!skip_visual)
-  {
-    computeJacobianAndUpdateEKF();
-    // All views used the same pre-update map. Commit patches only afterwards.
-    for (auto &camera : cameras)
-      if (camera->active) camera->finishFrame(pg, map);
-  }
-  if (audit)
+  auto update=[&](const vector<MeasureGroup::Image> &views,double timestamp) {
+    for(auto &camera:cameras)camera->active=false;
+    for(const auto &image:views) {
+      auto &camera=*cameras.at(image.camera_index);
+      if(camera.active)throw std::runtime_error("Duplicate camera in image bundle");
+      camera.active=true;camera.state_timestamp=timestamp;camera.prepareFrame(image,pg,map);
+    }
+    // Shared depth/normal uncertainty contributes through one view per bundle.
+    // Keep this set across all sequential events, not just one camera call.
+    for(auto &camera:cameras)
+      if(camera->active)
+        for(int i=0;i<camera->total_points;++i)
+          if(!claimed.insert(camera->visual_submap->voxel_points[i]).second)camera->noise_weights[i]=0;
+    if(!skip_visual)computeJacobianAndUpdateEKF();
     for (const auto &camera : cameras)
       if (camera->active)
       {
+        camera->observation_state=*state;
         size_t used = 0;
         for (double w : camera->noise_weights) if (w != 0) ++used;
-        audit << std::setprecision(17) << camera->image_timestamp << ',' << camera->id << ','
+        if(audit)audit << std::setprecision(17) << camera->image_timestamp << ',' << camera->id << ','
               << camera->total_points << ',' << used << ',' << state->exposure(camera->camera_index)
               << ',' << state->cov.trace() << '\n';
       }
+  };
+  if(advance) {
+    std::unordered_set<size_t> ids;
+    for(size_t i:cameraEventOrder(images)) {
+      if(!ids.insert(images[i].camera_index).second)throw std::runtime_error("Duplicate sequential camera");
+      advance(images[i].timestamp);update({images[i]},images[i].timestamp);
+    }
+  } else update(images,reference_time);
+  // Commit map changes after all observations, as in the joint update. Each
+  // asynchronous view retains its own posterior pose/exposure at acquisition.
+  for(auto &camera:cameras)camera->active=false;
+  for(const auto &image:images)cameras.at(image.camera_index)->active=true;
+  if(!skip_visual)
+    for(auto &camera:cameras)if(camera->active) {
+      StatesGroup *shared=camera->state;
+      camera->state=&camera->observation_state;
+      camera->finishFrame(pg,map);
+      camera->state=shared;
+    }
 }
 
 void VIOManager::computeJacobianAndUpdateEKF()

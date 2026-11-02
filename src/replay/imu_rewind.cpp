@@ -36,7 +36,7 @@ void ImuProcess::readInitialization(std::istream &in)
   for (auto *v : {&cov_acc,&cov_gyr,&cov_bias_acc,&cov_bias_gyr,
                   &mean_acc,&mean_gyr,&angvel_last,&acc_s_last}) readMatrix(in,*v);
   last_imu=readImu(in);
-  pcl_wait_proc.clear(); IMUpose.clear(); cur_pcl_un_->clear();
+  pcl_wait_proc.clear(); IMUpose.clear(); cur_pcl_un_->clear();motion_imu_carry.clear();motion_point_carry.clear();motion_point_origin=-1;
   imu_need_init=false;
 }
 
@@ -114,7 +114,7 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
     throw std::runtime_error("Startup replay could not rewind finite state to first input");
   // Change only translation gauge: first input starts at the local origin.
   state.pos_end.setZero();
-  pcl_wait_proc.clear(); IMUpose.clear(); cur_pcl_un_->clear();
+  pcl_wait_proc.clear(); IMUpose.clear(); cur_pcl_un_->clear();motion_imu_carry.clear();motion_point_carry.clear();motion_point_origin=-1;
   last_prop_end_time = begin; imu_time_init = false;
   last_imu = samples.front();
   if (last_imu->header.stamp.toSec() > begin)

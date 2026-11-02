@@ -32,7 +32,9 @@ public:
   void configureCameras();
   bool prepareImageBundle(double timestamp);
   void consumeImageBundle();
-  void saveCameraImages(const string &stamp, double timestamp);
+  void saveCameraImages(const string &stamp, double timestamp, double bundle_time=-1);
+  MeasureGroup collectLivoSlice(LidarMeasureGroup &meas,double timestamp);
+  void processSequentialVIO(bool visual_support);
   ofstream camera_frames_log;
   void initializeFiles();
   void recordInitializationDiagnostics();
@@ -141,6 +143,20 @@ public:
   vector<CameraQueue> camera_queues;
   vector<MeasureGroup::Image> pending_images;
   double camera_maximum_lateness = 0.5;
+  bool sequential_camera_updates = false;
+  bool bundle_sequential_updates = false;
+  bool sequential_anchor_event = false;
+  double last_camera_event_time = -1;
+  uint64_t last_camera_event_stamp = 0;
+  double camera_lidar_coverage = -1;
+  bool prepareCameraEvent(double &timestamp,double sensor_time);
+  bool syncCameraEvent(LidarMeasureGroup &meas);
+  void saveCameraEvent();
+  ofstream camera_event_frames_log, camera_input_log;
+  double bundle_lio_time = 0;
+  struct TimedWorldPoint {PointType point;V3D world;double timestamp;};
+  vector<TimedWorldPoint> inter_camera_points;
+  ofstream camera_events_log;
   deque<cv::Mat> &imageBuffer() { return camera_queues.at(vio_manager->anchor_index).images; }
   deque<double> &imageTimes() { return camera_queues.at(vio_manager->anchor_index).times; }
   vector<pointWithVar> _pv_list;

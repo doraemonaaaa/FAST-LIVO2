@@ -1,6 +1,7 @@
 #include "vio.h"
 #include "state_numerics.h"
 #include "camera_sync.h"
+#include "camera_events.h"
 #include <iostream>
 #include <stdexcept>
 
@@ -105,7 +106,45 @@ int main()
       view.visual_submap->reset();
       delete view.cam; view.cam=nullptr;
     }
-    std::cout << "PASS: 22-state algebra/cross covariance and four extrinsic-specific photometric Jacobians\n";
+    // Exercise actual bundle dispatch with no map observations: prediction
+    // times and per-camera poses must survive deferred map commit/export.
+    {
+      VIOManager manager;manager.state=&state;manager.state_propagat=&prior;
+      vector<MeasureGroup::Image> images;
+      const double times[]={2.000025,2.,2.000010,2.000010};
+      for(size_t k=0;k<4;++k) {
+        auto view=std::make_unique<VisualCamera>(manager.visual_map);
+        view->camera_index=k;view->camera_count=4;view->state=&state;view->state_propagat=&prior;
+        view->cam=new vk::PinholeCamera(64,48,1,30,31,32,24);
+        view->grid_size=12;view->grid_n_height=4;view->patch_size=4;view->patch_pyrimid_level=1;
+        view->max_iterations=1;view->img_point_cov=100;view->plot_flag=false;
+        view->raycast_en=false;view->normal_en=true;view->colmap_output_en=false;
+        view->exposure_estimate_en=true;view->inverse_composition_en=false;
+        view->setImuToLidarExtrinsic(V3D::Zero(),M3D::Identity());
+        vector<double> identity={1,0,0,0,1,0,0,0,1},zero={0,0,0};
+        view->setLidarToCameraExtrinsic(identity,zero);view->initializeVIO();
+        manager.cameras.push_back(std::move(view));
+        images.push_back({k,times[k],cv::Mat(48,64,CV_8UC1,cv::Scalar(9)),uint64_t(std::llround(times[k]*1e9))});
+      }
+      vector<pointWithVar> geometry;unordered_map<VOXEL_LOCATION,VoxelOctoTree *> planes;
+      vector<double> visits;
+      manager.processFrame(images,geometry,planes,2.,[&](double time) {
+        visits.push_back(time);state.pos_end=V3D(time,0,0);prior=state;
+      });
+      require(visits==vector<double>({times[1],times[2],times[3],times[0]}),"manager camera event order");
+      for(size_t k=0;k<4;++k) {
+        require(manager.cameras[k]->active,"completed bundle lost a camera");
+        require(manager.cameras[k]->state_timestamp==times[k],"camera state time was aligned to the wrong event");
+        require(manager.cameras[k]->observation_state.pos_end.x()==times[k],"map commit overwrote a historical camera state");
+      }
+      state.pos_end=V3D(2,0,0);prior=state;
+      manager.processFrame(images,geometry,planes,2.);
+      for(auto &view:manager.cameras) {
+        require(view->state_timestamp==2. && view->observation_state.pos_end.x()==2.,"joint mode must retain one common reference state");
+        delete view->cam;view->cam=nullptr;
+      }
+    }
+    std::cout << "PASS: 22-state algebra/cross covariance, four camera Jacobians and actual joint/sequential bundle dispatch\n";
   }
   catch (const std::exception &error)
   { std::cerr << error.what() << '\n'; return 1; }
