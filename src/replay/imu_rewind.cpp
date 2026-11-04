@@ -130,3 +130,32 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
       * G_m_s2 / IMU_mean_acc_norm - state.bias_a) + state.gravity;
 }
 
+
+void ImuProcess::deskewWholeScan(const PointCloudXYZI &raw,double begin,double end,
+    const StatesGroup &reference,const deque<sensor_msgs::Imu::ConstPtr> &samples,
+    PointCloudXYZI::Ptr output)
+{
+  if(raw.empty() || end<begin)throw std::runtime_error("Invalid physical scan interval");
+  auto integration=samples;
+  if(integration.empty()) {
+    // The recording may start before its first IMU. Reuse the same leading
+    // hold restored by initialization, rather than dropping the first scan.
+    sensor_msgs::Imu::Ptr held(new sensor_msgs::Imu(*last_imu));
+    held->header.stamp.fromSec(begin);integration.push_back(held);
+    ROS_WARN("[whole scan] leading IMU hold %.6f s",end-begin);
+  }
+  // A temporary inertial integration workspace, never a second estimator.
+  // Freeze bias/gravity/reference velocity once, rewind and integrate the entire
+  // physical scan with no intervening LIO/VIO measurement corrections.
+  ImuProcess motion;motion.set_extrinsic(Lid_offset_to_IMU,Lid_rot_to_IMU);
+  motion.ba_bg_est_en=ba_bg_est_en;motion.gravity_est_en=gravity_est_en;
+  motion.exposure_estimate_en=exposure_estimate_en;
+  std::stringstream checkpoint;writeInitialization(checkpoint);motion.readInitialization(checkpoint);
+  StatesGroup trajectory=reference;
+  motion.rewindForStartupReplay(trajectory,end,begin,integration);
+  LidarMeasureGroup scan;scan.last_lio_update_time=begin;scan.lio_vio_flg=LIO;
+  *scan.pcl_proc_cur=raw;
+  MeasureGroup m;m.lio_time=end;
+  for(const auto &sample:integration)if(sample->header.stamp.toSec()>begin)m.imu.push_back(sample);
+  scan.measures.push_back(m);motion.Process2(scan,trajectory,output);
+}

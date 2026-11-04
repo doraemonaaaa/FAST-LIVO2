@@ -32,6 +32,11 @@ void LIVMapper::configureCameras()
   if(update_mode!="joint" && update_mode!="sequential")
     throw std::runtime_error("camera_sync/update_mode must be joint or sequential");
   sequential_camera_updates=update_mode=="sequential";
+  string lio_clock;
+  nh.param<string>("camera_sync/lio_clock",lio_clock,"camera");
+  if(lio_clock!="camera" && lio_clock!="scan")throw std::runtime_error("lio_clock must be camera or scan");
+  scan_clock=lio_clock=="scan";
+  if(scan_clock && !sequential_camera_updates)throw std::runtime_error("scan clock requires sequential mode");
   if(sequential_camera_updates && !imu_en)
     throw std::runtime_error("Sequential camera updates require IMU propagation");
   if (!(std::isfinite(camera_maximum_lateness) && camera_maximum_lateness>0 && camera_maximum_lateness<2) ||
@@ -98,6 +103,11 @@ void LIVMapper::configureCameras()
   for (auto *state : {&_state, &state_propagat, &imu_propagate, &latest_ekf_state}) state->configureCameras(order.size());
   vio_manager->state = &_state; vio_manager->state_propagat = &state_propagat;
   camera_queues.resize(order.size());
+  if(scan_clock) {
+    scan_audit.open(string(ROOT_DIR)+"Log/scan_deskew.csv");
+    if(!scan_audit)throw std::runtime_error("Cannot open scan audit");
+    scan_audit<<"begin,end,points,imu_samples,velocity_norm,gyro_bias_norm,accel_bias_norm,gravity_norm\n";
+  }
   if (img_save_en)
   {
     camera_frames_log.open(string(ROOT_DIR) + "Log/camera_frames.jsonl");

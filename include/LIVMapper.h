@@ -144,6 +144,12 @@ public:
   vector<MeasureGroup::Image> pending_images;
   double camera_maximum_lateness = 0.5;
   bool sequential_camera_updates = false;
+  bool scan_clock = false;
+  bool syncScanEvent(LidarMeasureGroup &meas);
+  void processScanImu();
+  ofstream scan_audit;
+  double scan_begin = 0;
+  deque<sensor_msgs::Imu::ConstPtr> scan_imu_history;
   bool bundle_sequential_updates = false;
   bool sequential_anchor_event = false;
   double last_camera_event_time = -1;

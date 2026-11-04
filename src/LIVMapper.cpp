@@ -345,6 +345,7 @@ void LIVMapper::gravityAlignment()
 void LIVMapper::processImu() 
 {
   startup_replay.observeMeasurement(LidarMeasures);
+  if(scan_clock) {processScanImu();return;}
   // double t0 = omp_get_wtime();
 
   const double point_origin=LidarMeasures.last_lio_update_time;
@@ -468,7 +469,7 @@ void LIVMapper::handleVIO()
   //   visual_sub_map->push_back(temp_map);
   // }
 
-  if(!sequential_camera_updates || sequential_anchor_event)
+  if(!scan_clock && (!sequential_camera_updates || sequential_anchor_event))
     publish_frame_world(pubLaserCloudFullRes, vio_manager);
   if(sequential_camera_updates) {
     LidarMeasures.last_lio_update_time=LidarMeasures.measures.back().vio_time;
@@ -972,6 +973,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
+  if(scan_clock)scan_imu_history.push_back(msg);
   // cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
   mtx_buffer.unlock();
   if (imu_prop_enable)
@@ -994,6 +996,7 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
 
 bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
 {
+  if(slam_mode_==LIVO && scan_clock)return syncScanEvent(meas);
   if(slam_mode_==LIVO && sequential_camera_updates)return syncCameraEvent(meas);
   // A selected bundle has already passed sensor coverage checks. Complete its
   // VIO even if consuming LIO emptied a queue at EOF, in either update mode.
@@ -1199,6 +1202,7 @@ void LIVMapper::publish_img_rgb(const image_transport::Publisher &pubImage, VIOM
 // Provide output format for LiDAR-visual BA
 void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager)
 {
+  const bool color_event=LidarMeasures.lio_vio_flg==VIO || (scan_clock && LidarMeasures.lio_vio_flg==LIO);
   if (startup_replay.pending())
   {
     pcl_wait_pub->clear();
@@ -1218,7 +1222,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   static int pub_num = 1;
   pub_num++;
 
-  if (LidarMeasures.lio_vio_flg == VIO)
+  if (color_event)
   {
     *pcl_wait_pub += *pcl_w_wait_pub;
     *pcl_b_wait_color += *pcl_b_wait_pub;
@@ -1285,7 +1289,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
 
   /*** Publish Frame ***/
   sensor_msgs::PointCloud2 laserCloudmsg;
-  if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
+  if (slam_mode_ == LIVO && color_event)
   {
     pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
   }
@@ -1301,7 +1305,7 @@ void LIVMapper::publish_frame_world(const ros::Publisher &pubLaserCloudFullRes, 
   // Geometry consumers keep using pcd_save/type=1; this sidecar lets every
   // downstream trajectory render exactly the same native points and colours.
   if (pcd_save_en && pcd_save_native_body_rgb_en
-      && LidarMeasures.lio_vio_flg == VIO)
+      && color_event)
   {
     std::stringstream rgb_time;
     rgb_time << std::fixed << std::setprecision(6) <<

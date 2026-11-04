@@ -54,6 +54,9 @@ public:
       const deque<sensor_msgs::Imu::ConstPtr> &samples);
   void writeInitialization(std::ostream &out) const;
   void readInitialization(std::istream &in);
+  void deskewWholeScan(const PointCloudXYZI &raw, double begin, double end,
+      const StatesGroup &reference, const deque<sensor_msgs::Imu::ConstPtr> &samples,
+      PointCloudXYZI::Ptr output);
 
   ofstream fout_imu;
   double IMU_mean_acc_norm;
