@@ -162,6 +162,7 @@ void LIVMapper::processSequentialVIO(bool visual_support)
     }
     slice.measures.push_back(m);
     PointCloudXYZI::Ptr deskewed(new PointCloudXYZI());
+    constrainGravityBeforePrediction(timestamp);
     p_imu->Process2(slice,_state,deskewed,true);
     if(!p_imu->imu_need_init && !startup_replay.pending()) {
       if(deskewed->size()!=point_times.size())throw std::runtime_error("Inter-camera LiDAR point count changed");

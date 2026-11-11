@@ -124,6 +124,10 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
+  nh.param<bool>("imu/gravity_norm_constraint",gravity_norm_constraint,true);
+  nh.param<double>("imu/gravity_norm_sigma",gravity_norm_sigma,.02);
+  if(!std::isfinite(gravity_norm_sigma) || gravity_norm_sigma<=0)
+    throw std::runtime_error("Gravity norm sigma must be positive and finite");
   bool fixed_eigen_cache;
   int eigen_l1_cache_bytes, eigen_l2_cache_bytes, eigen_l3_cache_bytes, eigen_threads;
   nh.param<bool>("numerics/fixed_eigen_cache", fixed_eigen_cache, false);
@@ -345,6 +349,10 @@ void LIVMapper::gravityAlignment()
 void LIVMapper::processImu() 
 {
   startup_replay.observeMeasurement(LidarMeasures);
+  if(!(bundle_sequential_updates && LidarMeasures.lio_vio_flg==VIO)) {
+    const auto& measure=LidarMeasures.measures.back();
+    constrainGravityBeforePrediction(LidarMeasures.lio_vio_flg==LIO?measure.lio_time:measure.vio_time);
+  }
   if(scan_clock) {processScanImu();return;}
   // double t0 = omp_get_wtime();
 
@@ -881,6 +889,7 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
+  startup_replay.observeScan(*ptr,cur_head_time);
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -924,6 +933,7 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
     return;
   }
 
+  startup_replay.observeScan(*ptr,cur_head_time);
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;

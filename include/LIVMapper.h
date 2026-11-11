@@ -14,8 +14,8 @@ which is included as part of this source code package.
 #define LIV_MAPPER_H
 
 #include "IMU_Processing.h"
-#include "replay/initialization_diagnostics.h"
-#include "replay/startup_replay.h"
+#include "initialization/initialization_diagnostics.h"
+#include "initialization/startup_replay.h"
 #include "vio.h"
 #include "preprocess.h"
 #include <cv_bridge/cv_bridge.h>
@@ -47,6 +47,9 @@ public:
   void handleLIO();
   void savePCD();
   void processImu();
+  void constrainGravityBeforePrediction(double target);
+  bool gravity_norm_constraint=true;
+  double gravity_norm_sigma=.02;
   StartupReplay startup_replay;
   
   bool sync_packages(LidarMeasureGroup &meas);

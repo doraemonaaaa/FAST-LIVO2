@@ -15,7 +15,7 @@ which is included as part of this source code package.
 #include <stdexcept>
 #include <cstdlib>
 #include <iomanip>
-#include "motion_initializer.h"
+#include "initialization/motion_initializer.h"
 
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
                            Zero3d(0, 0, 0), b_first_frame(true), imu_need_init(true)
@@ -126,9 +126,19 @@ void ImuProcess::enable_motion_initialization()
   if (!orientation_initialization) throw std::runtime_error("motion initialization requires IMU attitude");
   bool timeout_fallback=false, estimate_gravity=true;
   ros::NodeHandle nh;
+  bool staged=false;nh.param<bool>("imu/staged_initialization",staged,false);
+  if(staged) {
+    vector<double> bg,ba;
+    if(!nh.getParam("imu/initial_bias_g",bg) || !nh.getParam("imu/initial_bias_a",ba) || bg.size()!=3 || ba.size()!=3)
+      throw std::runtime_error("Staged motion initialization requires batch bias means");
+    initial_gyro_bias=V3D(bg[0],bg[1],bg[2]);initial_acc_bias=V3D(ba[0],ba[1],ba[2]);
+    if(!initial_gyro_bias.allFinite() || !initial_acc_bias.allFinite())throw std::runtime_error("Invalid batch bias means");
+    seeded_bias=true; // Preserve the original ESIKF covariance, seed means only.
+  }
   nh.param<bool>("imu/motion_initialization_timeout_fallback", timeout_fallback, false);
   nh.param<bool>("imu/motion_initialization_estimate_gravity", estimate_gravity, true);
   motion_initializer.reset(new MotionInitializer(timeout_fallback, initialization_velocity_sigma, estimate_gravity));
+  if(seeded_bias)motion_initializer->setBias(initial_gyro_bias,initial_acc_bias,G_m_s2/initialization_acceleration_norm);
 }
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
@@ -175,7 +185,8 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
   // Static initialization observes gyro bias directly. Orientation-based
   // initialization may happen in motion, so its mean is not a bias estimate.
-  state_inout.bias_g = orientation_initialization ? Zero3d : mean_gyr;
+  state_inout.bias_g = orientation_initialization ? initial_gyro_bias : mean_gyr;
+  if(seeded_bias)state_inout.bias_a=initial_acc_bias;
 
   if (orientation_initialization)
   {
@@ -722,6 +733,10 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
         acc_s_last = stat.rot_end * V3D(last_imu->linear_acceleration.x,
             last_imu->linear_acceleration.y,last_imu->linear_acceleration.z) + stat.gravity;
         angvel_last = V3D(last_imu->angular_velocity.x,last_imu->angular_velocity.y,last_imu->angular_velocity.z);
+        if(seeded_bias) {
+          acc_s_last=stat.rot_end*(V3D(last_imu->linear_acceleration.x,last_imu->linear_acceleration.y,last_imu->linear_acceleration.z)*G_m_s2/IMU_mean_acc_norm-stat.bias_a)+stat.gravity;
+          angvel_last-=stat.bias_g;
+        }
         if (r.timeout_fallback)
           ROS_WARN("[motion init] TIMEOUT FALLBACK: current IMU attitude, zero velocity guess, velocity sigma >= 1 m/s; no accepted motion fit");
         ROS_WARN("[motion init] initial velocity %.6f %.6f %.6f m/s, std %.4f %.4f %.4f",

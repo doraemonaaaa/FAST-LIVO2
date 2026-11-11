@@ -93,6 +93,7 @@ find_package(catkin REQUIRED COMPONENTS
   vikit_ros
   cv_bridge
   image_transport
+  rosbag
 )
 
 find_package(Eigen3 REQUIRED)
@@ -100,6 +101,10 @@ find_package(PCL REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(Sophus REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread)
+find_package(Ceres REQUIRED)
+find_package(yaml-cpp REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(JSONCPP REQUIRED jsoncpp)
 
 set(Sophus_LIBRARIES libSophus.so)
 
@@ -117,14 +122,27 @@ include_directories(
   ${OpenCV_INCLUDE_DIRS}
   ${Sophus_INCLUDE_DIRS}
   include
+  ${CERES_INCLUDE_DIRS}
+  ${JSONCPP_INCLUDE_DIRS}
 )
 
 # Add libraries
 add_library(vio src/vio.cpp src/multi_camera_vio.cpp src/frame.cpp src/visual_point.cpp)
 add_library(lio src/voxel_map.cpp)
 add_library(pre src/preprocess.cpp)
-add_library(imu_proc src/IMU_Processing.cpp src/replay/imu_rewind.cpp)
-add_library(laser_mapping src/LIVMapper.cpp src/multi_camera_input.cpp src/sequential_vio.cpp src/scan_vio.cpp src/replay/startup_replay.cpp)
+add_library(initialization
+  src/initialization/batch_imu_initializer.cpp
+  src/initialization/batch_lidar_trajectory.cpp
+  src/initialization/imu_time_offset/lidar_rotation.cpp
+  src/initialization/imu_time_offset/scan_matching.cpp
+  src/initialization/imu_time_offset/imu_time_offset.cpp)
+target_link_libraries(initialization ${CERES_LIBRARIES} ${JSONCPP_LIBRARIES} ${PCL_LIBRARIES} ${catkin_LIBRARIES} ${OpenMP_CXX_LIBRARIES})
+add_executable(fastlivo_batch_initialize src/initialization/batch_main.cpp)
+target_link_libraries(fastlivo_batch_initialize initialization pre yaml-cpp ${catkin_LIBRARIES} ${PCL_LIBRARIES})
+add_library(imu_proc src/IMU_Processing.cpp src/initialization/imu_rewind.cpp)
+add_library(laser_mapping src/LIVMapper.cpp src/multi_camera_input.cpp src/sequential_vio.cpp src/scan_vio.cpp src/initialization/startup_replay.cpp src/initialization/staged_initialization.cpp)
+target_sources(laser_mapping PRIVATE src/initialization/gravity_norm_constraint.cpp)
+target_link_libraries(laser_mapping initialization)
 
 # Add the main executable
 add_executable(fastlivo_mapping src/main.cpp)
@@ -149,6 +167,12 @@ if(mimalloc_FOUND)
 endif()
 
 if(CATKIN_ENABLE_TESTING)
+  add_executable(batch_imu_initialization_test test/batch_imu_initialization_test.cpp)
+  target_link_libraries(batch_imu_initialization_test initialization ${catkin_LIBRARIES})
+  add_test(NAME batch_imu_initialization COMMAND batch_imu_initialization_test)
+  add_executable(gravity_norm_constraint_test test/gravity_norm_constraint_test.cpp)
+  target_link_libraries(gravity_norm_constraint_test ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenMP_CXX_LIBRARIES})
+  add_test(NAME gravity_norm_constraint COMMAND gravity_norm_constraint_test)
   add_executable(multi_camera_test test/multi_camera_test.cpp)
   target_link_libraries(multi_camera_test vio lio ${catkin_LIBRARIES} ${PCL_LIBRARIES}
                         ${OpenCV_LIBRARIES} ${Sophus_LIBRARIES} ${Boost_LIBRARIES} ${OpenMP_CXX_LIBRARIES})

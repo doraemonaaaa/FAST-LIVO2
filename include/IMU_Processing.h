@@ -44,6 +44,8 @@ public:
   void set_imu_init_frame_num(const int &num);
   void set_orientation_initialization(double acceleration_norm, double velocity_sigma, double gravity_sigma);
   void enable_motion_initialization();
+  V3D initial_gyro_bias=V3D::Zero(),initial_acc_bias=V3D::Zero();
+  bool seeded_bias=false;
   void disable_imu();
   void disable_gravity_est();
   void disable_bias_est();
@@ -70,6 +72,7 @@ public:
   double first_lidar_time;
   bool imu_time_init = false;
   bool imu_need_init = true;
+  double propagationTime() const { return last_prop_end_time; }
   M3D Eye3d;
   V3D Zero3d;
   int lidar_type;

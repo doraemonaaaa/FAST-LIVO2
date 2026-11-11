@@ -12,6 +12,7 @@
 // Points and inertial increments are expressed in the first scan's IMU frame.
 class MotionInitializer {
 public:
+  void setBias(const V3D &bg,const V3D &ba,double scale) {bias_seeded_=true;bg_=bg;ba_=ba;scale_=scale;}
   using PoseMatrix = Eigen::Matrix<double,6,6>;
   using PoseVector = Eigen::Matrix<double,6,1>;
   explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0, bool estimate_gravity=true)
@@ -55,7 +56,8 @@ public:
     if(first_attempt<0)first_attempt=end;
     if(start<0) {
       start=end; anchor=q; previous_time=end; last_scan_time=end;
-      last_sample={end,M3D::Identity(),V3D(m->linear_acceleration.x,m->linear_acceleration.y,m->linear_acceleration.z)};
+      gyro_rotation_.setIdentity();previous_omega_=V3D(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z)-bg_;
+      last_sample={end,M3D::Identity(),scale_*V3D(m->linear_acceleration.x,m->linear_acceleration.y,m->linear_acceleration.z)-ba_};
       if(!last_sample.acceleration.allFinite()) throw std::runtime_error("motion initialization: invalid acceleration");
       previous_acc=last_sample.acceleration+anchor.conjugate()*V3D(0,0,-9.81);
     }
@@ -69,8 +71,6 @@ public:
       out.velocity_cov=M3D::Identity()*fallback_velocity_sigma_*fallback_velocity_sigma_;
       return out;
     }
-    const M3D imu_rotation=(anchor.conjugate()*q).toRotationMatrix();
-    M3D R=last_rotation*last_imu_rotation.transpose()*imu_rotation;
     V3D gravity=anchor.conjugate()*V3D(0,0,-9.81);
     // Retain only IMU samples since the last accepted pose. Their acceleration
     // is integrated once the LiDAR endpoint rotation for this interval is known.
@@ -85,13 +85,19 @@ public:
       Eigen::Quaterniond qi(im->orientation.w,im->orientation.x,im->orientation.y,im->orientation.z);
       if(im->orientation_covariance[0]<0 || !qi.coeffs().allFinite() || std::abs(qi.norm()-1)>.01)
         throw std::runtime_error("motion initialization: invalid attitude in window");
-      const V3D acceleration(im->linear_acceleration.x,im->linear_acceleration.y,im->linear_acceleration.z);
+      const V3D acceleration=scale_*V3D(im->linear_acceleration.x,im->linear_acceleration.y,im->linear_acceleration.z)-ba_;
+      const V3D omega=V3D(im->angular_velocity.x,im->angular_velocity.y,im->angular_velocity.z)-bg_;
+      const V3D midpoint=.5*(previous_omega_+omega);
+      gyro_rotation_=gyro_rotation_*Exp(midpoint,dt);previous_omega_=omega;
       if(!acceleration.allFinite()) throw std::runtime_error("motion initialization: invalid acceleration");
-      pending_imus.push_back({time,(anchor.conjugate()*qi.normalized()).toRotationMatrix(),acceleration});
+      const M3D sample_rotation=bias_seeded_?gyro_rotation_:(anchor.conjugate()*qi.normalized()).toRotationMatrix();
+      pending_imus.push_back({time,sample_rotation,acceleration});
       previous_time=time;
     }
     // End-of-scan attitude, rotational deskew, and the latest independent velocity estimate.
-    V3D omega(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z);
+    const M3D imu_rotation=bias_seeded_?M3D(gyro_rotation_*Exp(previous_omega_,std::max(0.,end-previous_time))):(anchor.conjugate()*q).toRotationMatrix();
+    M3D R=last_rotation*last_imu_rotation.transpose()*imu_rotation;
+    V3D omega=V3D(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z)-bg_;
     PointCloudXYZI::Ptr cloud(new PointCloudXYZI());
     for(const auto &pt:scan) {
       V3D p(pt.x,pt.y,pt.z); if(!p.allFinite() || p.norm()<1 || p.norm()>45) continue;
@@ -189,6 +195,10 @@ public:
     return out;
   }
 private:
+  bool bias_seeded_=false;
+  V3D bg_=V3D::Zero(),ba_=V3D::Zero(),previous_omega_=V3D::Zero();
+  double scale_=1.;
+  M3D gyro_rotation_=M3D::Identity();
   struct InertialSample { double time; M3D rotation; V3D acceleration; };
   std::vector<InertialSample> pending_imus;
   InertialSample last_sample{0,M3D::Identity(),V3D::Zero()};

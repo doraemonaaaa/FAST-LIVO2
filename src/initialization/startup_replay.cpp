@@ -1,5 +1,5 @@
-#include "replay/startup_replay.h"
-#include "replay/initialization_checkpoint.h"
+#include "initialization/startup_replay.h"
+#include "initialization/initialization_checkpoint.h"
 #include "LIVMapper.h"
 #include <map>
 #include <cstdio>
@@ -19,6 +19,7 @@ void StartupReplay::readParameters(ros::NodeHandle &nh, bool imu_en)
   if (!imu_en || maximum_mb<=0 || (phase!="prepare" && phase!="run") || checkpoint_.empty() || identity_.empty())
     throw std::runtime_error("Two-pass initialization requires the offline export runner, enabled IMU and a positive cache budget");
   phase_=phase=="prepare" ? Phase::Preparing : Phase::Replaying;
+  stages_.configure(nh);
   limit_=size_t(maximum_mb)*1024*1024;
 }
 
@@ -69,6 +70,7 @@ StartupReplay::Index StartupReplay::index(const LidarMeasureGroup &group) const
 void StartupReplay::observeMeasurement(const LidarMeasureGroup &group)
 {
   if (!pending() && !replaying()) return;
+  if(pending())stages_.observe(group);
   const Index current=index(group);
   if (pending())
   {
@@ -124,6 +126,7 @@ void StartupReplay::afterUpdate(LIVMapper &mapper)
     return;
   }
   if (!pending() || mapper.p_imu->imu_need_init) return;
+  if(!stages_.advance(mapper))return;
   end_=mapper.LidarMeasures.last_lio_update_time;
   std::map<uint64_t,sensor_msgs::Imu::ConstPtr> ordered;
   for (const auto &imu : imu_samples_)

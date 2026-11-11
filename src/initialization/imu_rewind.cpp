@@ -12,7 +12,7 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 #include "state_numerics.h"
-#include "replay/initialization_checkpoint.h"
+#include "initialization/initialization_checkpoint.h"
 #include <stdexcept>
 
 void ImuProcess::writeInitialization(std::ostream &out) const

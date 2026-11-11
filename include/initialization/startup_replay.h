@@ -1,6 +1,7 @@
 #ifndef FAST_LIVO_STARTUP_REPLAY_H
 #define FAST_LIVO_STARTUP_REPLAY_H
 #include "common_lib.h"
+#include "initialization/staged_initialization.h"
 #include <fstream>
 #include <ros/node_handle.h>
 
@@ -18,12 +19,14 @@ public:
   bool replaying() const { return phase_ == Phase::Replaying; }
   bool prepared() const { return phase_ == Phase::Prepared; }
   void retainImuForInitialization(const sensor_msgs::Imu::ConstPtr &imu);
+  void observeScan(const PointCloudXYZI& points,double begin) { if(pending())stages_.observeScan(points,begin); }
   void observeMeasurement(const LidarMeasureGroup &group);
   void prepareNextInput(LidarMeasureGroup &group) const;
   void afterUpdate(LIVMapper &mapper);
   void restore(LIVMapper &mapper);
   void finish();
 private:
+  StagedInitialization stages_;
   struct Index { double begin,end; uint64_t fingerprint; size_t points,images; int flag; };
   Index index(const LidarMeasureGroup &group) const;
   enum class Phase { Disabled, Preparing, Prepared, Replaying, Complete };
