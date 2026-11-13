@@ -2,6 +2,7 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Eigenvalues>
 #include <numeric>
+#include "imu_support.h"
 #include <stdexcept>
 
 namespace initialization { namespace imu_time_offset {
@@ -35,7 +36,7 @@ bool HasImuCoverage(const RotationCloud& input,
         [](double time,const auto& sample) { return time < sample->timestamp; });
     for (; it != imu.end(); ++it) {
         const auto& a = **(it-1); const auto& b = **it;
-        if (b.timestamp <= a.timestamp || b.timestamp-a.timestamp > .025 ||
+        if (b.timestamp <= a.timestamp || b.timestamp-a.timestamp > imu_support::kMaximumGap ||
             !a.acceleration.allFinite() || !a.angular_velocity.allFinite() ||
             !b.acceleration.allFinite() || !b.angular_velocity.allFinite()) return false;
         // Include the sample bracketing the right edge.

@@ -1,5 +1,6 @@
 #pragma once
 #include "initialization/input.h"
+#include "initialization/parallel.hpp"
 #include <filesystem>
 #include <json/json.h>
 
@@ -26,7 +27,7 @@ struct BatchImuInitialization {
 };
 
 BatchLidarTrajectory BuildBatchLidarTrajectory(const std::vector<LivoScan>& scans,
-    const Eigen::Matrix4d& imu_lidar);
+    const Eigen::Matrix4d& imu_lidar, int workers=kDefaultInitializationThreads);
 
 // Bias is approximately constant within this short calibration window. Both
 // biases and gravity remain estimated by the normal ESIKF after handoff.

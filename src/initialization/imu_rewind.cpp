@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "IMU_Processing.h"
+#include "imu_support.h"
 #include "state_numerics.h"
 #include "initialization/initialization_checkpoint.h"
 #include <stdexcept>
@@ -45,28 +46,13 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
 {
   if (imu_need_init || samples.empty() || !std::isfinite(begin) || end < begin)
     throw std::runtime_error("Startup replay requires initialized state and ordered IMU coverage");
-  auto integration = samples;
-  if (integration.front()->header.stamp.toSec() > begin)
-  {
-    sensor_msgs::Imu::Ptr held(new sensor_msgs::Imu(*integration.front()));
-    held->header.stamp.fromSec(begin);
-    integration.push_front(held);
-  }
-  // Reverse midpoint/last-sample-hold inertial dynamics over cached IMU times.
-  // Add process uncertainty while going backwards; do not treat the terminal
-  // filtered covariance as an exact initial-state observation.
-  double cursor = end;
-  for (int i = int(integration.size()) - 1; i >= 0 && cursor > begin; --i)
-  {
-    const auto &head = integration[i];
-    double left = std::max(begin, head->header.stamp.toSec());
-    if (i == 0) left = begin; // At most the missing leading sample interval.
-    if (left >= cursor) continue;
-    const auto &tail = i + 1 < int(integration.size()) ? integration[i + 1] : head;
-    double dt = cursor - left;
-    if (dt > .1)
-      ROS_WARN("[startup replay] IMU interval %.6f s (%.9f..%.9f): midpoint/hold approximation with process uncertainty",
-          dt, left, cursor);
+  const auto integration=imu_support::Clip(samples,begin,end);
+  // Reverse midpoint dynamics only between measured/interpolated endpoints.
+  // Uncertainty is added while rewinding; no boundary sample is extended.
+  double cursor=end;
+  for(int i=int(integration.size())-2;i>=0;--i) {
+    const auto& head=integration[i];const auto& tail=integration[i+1];
+    const double left=head->header.stamp.toSec(),dt=tail->header.stamp.toSec()-left;
     V3D omega = .5 * V3D(head->angular_velocity.x + tail->angular_velocity.x,
         head->angular_velocity.y + tail->angular_velocity.y,
         head->angular_velocity.z + tail->angular_velocity.z) - state.bias_g;
@@ -110,19 +96,14 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
     state.rot_end = rotation;
     cursor = left;
   }
-  if (cursor > begin || !state.pos_end.allFinite() || !state.vel_end.allFinite() || !state.cov.allFinite())
+  // Compare acquired time endpoints at ROS integer-nanosecond resolution.
+  if (ros::Time().fromSec(cursor) > ros::Time().fromSec(begin) || !state.pos_end.allFinite() || !state.vel_end.allFinite() || !state.cov.allFinite())
     throw std::runtime_error("Startup replay could not rewind finite state to first input");
   // Change only translation gauge: first input starts at the local origin.
   state.pos_end.setZero();
   pcl_wait_proc.clear(); IMUpose.clear(); cur_pcl_un_->clear();motion_imu_carry.clear();motion_point_carry.clear();motion_point_origin=-1;
   last_prop_end_time = begin; imu_time_init = false;
-  last_imu = samples.front();
-  if (last_imu->header.stamp.toSec() > begin)
-  {
-    sensor_msgs::Imu::Ptr held(new sensor_msgs::Imu(*last_imu));
-    held->header.stamp.fromSec(begin);
-    last_imu = held;
-  }
+  last_imu=integration.front();
   angvel_last = V3D(last_imu->angular_velocity.x, last_imu->angular_velocity.y,
       last_imu->angular_velocity.z) - state.bias_g;
   acc_s_last = state.rot_end * (V3D(last_imu->linear_acceleration.x,
@@ -136,14 +117,7 @@ void ImuProcess::deskewWholeScan(const PointCloudXYZI &raw,double begin,double e
     PointCloudXYZI::Ptr output)
 {
   if(raw.empty() || end<begin)throw std::runtime_error("Invalid physical scan interval");
-  auto integration=samples;
-  if(integration.empty()) {
-    // The recording may start before its first IMU. Reuse the same leading
-    // hold restored by initialization, rather than dropping the first scan.
-    sensor_msgs::Imu::Ptr held(new sensor_msgs::Imu(*last_imu));
-    held->header.stamp.fromSec(begin);integration.push_back(held);
-    ROS_WARN("[whole scan] leading IMU hold %.6f s",end-begin);
-  }
+  const auto integration=imu_support::Clip(samples,begin,end,imu_support::kMaximumGap);
   // A temporary inertial integration workspace, never a second estimator.
   // Freeze bias/gravity/reference velocity once, rewind and integrate the entire
   // physical scan with no intervening LIO/VIO measurement corrections.

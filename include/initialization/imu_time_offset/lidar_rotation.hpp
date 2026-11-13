@@ -32,6 +32,12 @@ RotationPhases RotationClouds(const LivoScan& scan, const Eigen::Matrix4d& trans
 RotationCloud FullRotationCloud(const RotationPhases& phases);
 RotationFit RegisterRotation(const RotationCloud& target, const RotationCloud& source,
                              const RotationFit& prediction);
+// Frozen geometry and valid previous-pass guesses are independent; missing
+// guesses retain the preceding current-pass result in input order.
+std::vector<RotationFit> RegisterRotationPairs(const std::vector<RotationCloud>& clouds,
+    const std::vector<RotationFit>& previous, int workers);
+std::vector<RotationFit> RegisterRotationPairs(const std::vector<RotationCloud>& clouds,
+    const std::vector<RotationFit>& previous, int workers, const std::vector<bool>& enabled);
 LidarTwist EstimateTwist(const RotationFit& backward, double dt_backward,
                          const RotationFit& forward, double dt_forward);
 LidarTwist ShiftTwistReference(const LidarTwist& twist, double dt);

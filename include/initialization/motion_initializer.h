@@ -1,3 +1,4 @@
+#include "imu_support.h"
 #pragma once
 #include "common_lib.h"
 #include "motion_gravity_fit.h"
@@ -49,6 +50,8 @@ public:
                 const M3D &R_LI, const V3D &t_LI) {
     Result out;
     if(imus.empty() || scan.empty()) return out;
+    if(imus.back()->header.stamp.toNSec()<ros::Time().fromSec(end).toNSec())
+      throw std::runtime_error("motion initialization would extrapolate beyond acquired IMU");
     const auto &m=imus.back(); Eigen::Quaterniond q(m->orientation.w,m->orientation.x,m->orientation.y,m->orientation.z);
     if(m->orientation_covariance[0]<0 || !q.coeffs().allFinite() || std::abs(q.norm()-1)>.01)
       throw std::runtime_error("motion initialization: invalid IMU attitude");
@@ -77,7 +80,7 @@ public:
     for(const auto &im:imus) {
       double time=im->header.stamp.toSec(); if(time<=previous_time) continue;
       double dt=time-previous_time;
-      if(dt>.1) {
+      if(dt>imu_support::kMaximumGap) {
         ROS_WARN("[motion init] IMU gap %.6f s: discard startup window and restart",dt);
         resetWindow();
         return update(scan,begin,end,imus,R_LI,t_LI);
@@ -95,7 +98,7 @@ public:
       previous_time=time;
     }
     // End-of-scan attitude, rotational deskew, and the latest independent velocity estimate.
-    const M3D imu_rotation=bias_seeded_?M3D(gyro_rotation_*Exp(previous_omega_,std::max(0.,end-previous_time))):(anchor.conjugate()*q).toRotationMatrix();
+    const M3D imu_rotation=bias_seeded_?gyro_rotation_:(anchor.conjugate()*q).toRotationMatrix();
     M3D R=last_rotation*last_imu_rotation.transpose()*imu_rotation;
     V3D omega=V3D(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z)-bg_;
     PointCloudXYZI::Ptr cloud(new PointCloudXYZI());
@@ -216,8 +219,8 @@ private:
       previous_acc=acc;cursor=time;
     };
     for(const auto &sample:pending_imus) {advance(sample,sample.time);last_sample=sample;}
-    // Match the LiDAR endpoint exactly using a final measurement hold.
-    advance(last_sample,end);pending_imus.clear();
+    if(std::abs(cursor-end)>1e-7)throw std::runtime_error("motion initialization requires an IMU endpoint bracket");
+    pending_imus.clear();
   }
   bool timeout_fallback_;
   double fallback_velocity_sigma_;

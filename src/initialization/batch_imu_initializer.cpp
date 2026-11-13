@@ -1,5 +1,6 @@
 #include "initialization/batch_imu_initializer.hpp"
 #include <ceres/ceres.h>
+#include "imu_support.h"
 #include <ceres/rotation.h>
 #include <Eigen/QR>
 #include <Eigen/SVD>
@@ -31,8 +32,9 @@ struct GravityChart {
 struct Reading {V3D gyro,acceleration;};
 Reading Interpolate(const std::vector<ImuSample::ConstPtr>& imu,double time) {
     auto next=std::lower_bound(imu.begin(),imu.end(),time,[](const auto& s,double t){return s->timestamp<t;});
-    if(next==imu.end()) return {imu.back()->angular_velocity,imu.back()->acceleration};
-    if(next==imu.begin()) return {(*next)->angular_velocity,(*next)->acceleration};
+    if(time<imu.front()->timestamp || time>imu.back()->timestamp)
+        throw std::runtime_error("batch IMU interpolation outside acquired samples");
+    if(next!=imu.end() && (*next)->timestamp==time)return {(*next)->angular_velocity,(*next)->acceleration};
     const auto& a=**(next-1);const auto& b=**next;
     const double f=(time-a.timestamp)/(b.timestamp-a.timestamp);
     return {(1.-f)*a.angular_velocity+f*b.angular_velocity,(1.-f)*a.acceleration+f*b.acceleration};
@@ -45,10 +47,8 @@ struct Interval {
     M3D Jr=M3D::Zero(),Jv=M3D::Zero(),Jp=M3D::Zero();
 };
 Interval Integrate(const std::vector<ImuSample::ConstPtr>& imu,double begin,double end,const V3D& bg) {
-    // A scan midpoint may precede the first IMU by part of one scan. Match
-    // the reviewed interpolation's endpoint hold, but bound missing coverage.
-    if(begin<imu.front()->timestamp-.1 || end>imu.back()->timestamp+.1 || end<=begin)
-        throw std::runtime_error("batch calibration has insufficient IMU coverage");
+    if(imu_support::Check(imu,begin,end,[](const auto& s){return s->timestamp;})!=imu_support::Coverage::Covered)
+        throw std::runtime_error("batch calibration requires continuous measured IMU coverage");
     std::vector<double> times{begin};
     auto next=std::upper_bound(imu.begin(),imu.end(),begin,[](double t,const auto& s){return t<s->timestamp;});
     for(;next!=imu.end() && (*next)->timestamp<end;++next) times.push_back((*next)->timestamp);
@@ -185,8 +185,7 @@ BatchImuInitialization SolveBatchImuInitialization(const std::vector<BatchLidarP
     auto& report=out.report;
     report["method"]="joint_lidar_imu_batch_bias_initialization";
     report["calibration_begin_s"]=out.calibration_begin;report["calibration_end_s"]=out.calibration_end;
-    report["leading_imu_hold_s"]=std::max(0.,imu.front()->timestamp-out.calibration_begin);
-    report["trailing_imu_hold_s"]=std::max(0.,out.calibration_end-imu.back()->timestamp);
+    report["imu_coverage_policy"]="strict_endpoint_brackets_and_maximum_25ms_sample_gap";
     report["keyframes"]=Json::UInt64(poses.size());report["gyro_bias_prior_sigma_rad_s"]=.01;
     report["acceleration_bias_prior_sigma_m_s2"]=.3;report["gravity_norm_m_s2"]=out.gravity.norm();
     report["solver"]=summary.BriefReport();report["initial_cost"]=summary.initial_cost;report["final_cost"]=summary.final_cost;

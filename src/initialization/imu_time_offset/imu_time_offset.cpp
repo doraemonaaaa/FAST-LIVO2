@@ -3,6 +3,8 @@
 #include "initialization/imu_time_offset/scan_matching.hpp"
 #include <fstream>
 #include <iomanip>
+#include <optional>
+#include <chrono>
 
 namespace initialization {
 namespace {
@@ -99,33 +101,43 @@ livo::ImuTimeOffsetResult EstimateImuTimeOffset(
     auto corrected = full;
     std::vector<RotationFit> fits(full.size());
     std::vector<LidarTwist> twists(full.size());
+    std::vector<bool> pair_enabled(full.size(),false);
+    for (size_t i = 1; i < full.size(); ++i) {
+        const double dt = full[i].time-full[i-1].time;
+        pair_enabled[i] = !(dt <= .025 || dt >= .2);
+    }
+    const auto reference_start=std::chrono::steady_clock::now();
     for (int pass = 0; pass < 3; ++pass) {
-        std::vector<RotationFit> next(full.size()); size_t accepted = 0;
-        for (size_t i = 1; i < full.size(); ++i) {
-            const double dt = full[i].time-full[i-1].time;
-            if (dt <= .025 || dt >= .2) continue;
-            auto prediction = fits[i];
-            if (!prediction.valid && i > 1) prediction = next[i-1];
-            next[i] = RegisterRotation(corrected[i-1],corrected[i],prediction);
-            accepted += next[i].valid;
-        }
+        if(param.progress)param.progress();
+        auto next = RegisterRotationPairs(corrected,fits,param.workers,pair_enabled);
+        size_t accepted = 0;
+        for (size_t i = 1; i < full.size(); ++i) accepted += next[i].valid;
         fits = std::move(next);
-        for (size_t i = 1; i+1 < full.size(); ++i) {
-            // Do not keep stale valid twists if reference registration fails.
-            twists[i] = EstimateTwist(fits[i],full[i].time-full[i-1].time,
-                fits[i+1],full[i+1].time-full[i].time);
-        }
-        for (size_t i = 0; i < full.size(); ++i)
+        // Fits are frozen. Each task updates only its own twist and cloud;
+        // all clouds finish before the next registration pass starts.
+        ForEachInitializationTask(full.size(),param.workers,[&](size_t i) {
+            if (i && i+1 < full.size()) {
+                // Replace stale valid twists even when registration fails.
+                twists[i] = EstimateTwist(fits[i],full[i].time-full[i-1].time,
+                    fits[i+1],full[i+1].time-full[i].time);
+            }
             corrected[i] = twists[i].valid ? DeskewRotationCloud(full[i],twists[i]) : full[i];
+        });
         std::clog << "[imu time offset init] reference pass=" << pass
                        << " scans=" << full.size() << " accepted=" << accepted;
     }
     // Pair final reference geometry with transforms fitted to that geometry.
-    for (size_t i = 1; i < full.size(); ++i) {
+    // This refit uses each pair's own frozen guess, without chain fallback.
+    auto refitted = fits;
+    ForEachInitializationTask(full.size()-1,param.workers,[&](size_t job) {
+        const size_t i = job+1;
         const double dt = full[i].time-full[i-1].time;
-        fits[i] = dt > .025 && dt < .2 ?
+        refitted[i] = dt > .025 && dt < .2 ?
             RegisterRotation(corrected[i-1],corrected[i],fits[i]) : RotationFit{};
-    }
+    });
+    fits = std::move(refitted);
+    const auto maps_start=std::chrono::steady_clock::now();
+    if(param.progress)param.progress();
     struct Query {
         size_t index; RotationCloud raw; FrozenPlaneMap map; DeskewState state; bool validation;
     };
@@ -133,21 +145,23 @@ livo::ImuTimeOffsetResult EstimateImuTimeOffset(
     const double split = begin+.7*(last-begin);
     // Even scans are queries; only odd scans enter reference maps. Use every
     // eligible query so the held-out tail retains enough observations.
-    for (size_t i = 2; i+2 < full.size(); i += 2) {
+    std::vector<std::optional<Query>> prepared_queries((full.size()-3)/2);
+    ForEachInitializationTask(prepared_queries.size(),param.workers,[&](size_t job) {
+        const size_t i = 2+2*job;
         if (!fits[i].valid || !fits[i+1].valid || !twists[i].valid ||
-            !twists[i-1].valid || !twists[i+1].valid) continue;
+            !twists[i-1].valid || !twists[i+1].valid) return;
         auto raw = SampleQuery(full[i]);
-        if (raw.cloud->size() < 200 || !HasImuCoverage(raw,imu,maximum_shift+.001)) continue;
+        if (raw.cloud->size() < 200 || !HasImuCoverage(raw,imu,maximum_shift+.001)) return;
         auto target = ReferenceMap(corrected[i-1],corrected[i+1],fits[i],fits[i+1]);
         DeskewState state;
         state.acceleration_scale=9.81/param.initialization_acceleration_norm;
         {
             auto next = std::lower_bound(states.begin(),states.end(),raw.time,
                 [](const auto& s,double t){return s.time<t;});
-            if (next==states.end() || (next==states.begin() && next->time>raw.time)) continue;
+            if (next==states.end() || (next==states.begin() && next->time>raw.time)) return;
             const auto& b=*next;
             const auto& a=next==states.begin() ? b : *(next-1);
-            if (b.time-a.time>.2) continue;
+            if (b.time-a.time>.2) return;
             const double u=b.time>a.time ? (raw.time-a.time)/(b.time-a.time) : 0.;
             const auto rotation=Eigen::Quaterniond(a.rotation).slerp(u,Eigen::Quaterniond(b.rotation)).toRotationMatrix();
             state.velocity=rotation.transpose()*((1-u)*a.velocity+u*b.velocity);
@@ -155,21 +169,32 @@ livo::ImuTimeOffsetResult EstimateImuTimeOffset(
             state.gyro_bias=(1-u)*a.gyro_bias+u*b.gyro_bias;
             state.acceleration_bias=(1-u)*a.acceleration_bias+u*b.acceleration_bias;
         }
-        queries.push_back({i,std::move(raw),FrozenPlaneMap(target),state,full[i].time >= split});
-    }
+        prepared_queries[job].emplace(Query{i,std::move(raw),FrozenPlaneMap(target),state,full[i].time >= split});
+    });
+    // Keep query admission and order identical to the original sequential loop.
+    for (auto& query : prepared_queries) if (query) queries.push_back(std::move(*query));
     std::ofstream details(diagnostics/"imu_time_offset_matches.csv");
     std::ofstream curve(diagnostics/"imu_time_offset_curve.csv");
     if (!details || !curve) throw std::runtime_error("cannot create IMU offset matching diagnostics");
     details << "scan,relative_time,split,stamp_shift_ms,effective_imu_time_offset_ms,registered,points,matches,match_ratio,inlier_rms_m,capped_rms_m,balanced_score\n" << std::setprecision(17);
     curve << "stamp_shift_ms,effective_imu_time_offset_ms,train_match_ratio,validation_match_ratio,match_ratio,inlier_rms_m,capped_rms_m,points,matches,registered_scans,query_scans,train_balanced_score,validation_balanced_score,balanced_score\n" << std::setprecision(17);
+    const auto scoring_start=std::chrono::steady_clock::now();
     std::vector<livo::OffsetCandidateScore> scores;
+    std::vector<livo::OffsetMatchScore> query_scores(queries.size());
     for (double shift : candidate_shifts) {
+        if(param.progress)param.progress();
         livo::OffsetCandidateScore candidate; candidate.stamp_shift_s = shift;
-        for (const auto& query : queries) {
-            // Same rough LiDAR velocity and IMU-attitude gravity for every
-            // candidate. Final motion initialization uses the selected clock.
-            const auto cloud = DeskewWithImu(query.raw,imu,query.state,candidate.stamp_shift_s);
-            const auto score = query.map.Evaluate(cloud);
+        ForEachInitializationTask(queries.size(),param.workers,[&](size_t i) {
+            const auto& query=queries[i];
+            const auto cloud=DeskewWithImu(query.raw,imu,query.state,candidate.stamp_shift_s);
+            query_scores[i]=query.map.Evaluate(cloud);
+        });
+        // Callback, accumulation and CSV writes remain on the caller, in the
+        // original query order. Worker completion order cannot change a score.
+        for(size_t i=0;i<queries.size();++i) {
+            if(param.progress)param.progress();
+            const auto& query=queries[i];
+            const auto& score=query_scores[i];
             (query.validation ? candidate.validation : candidate.train) += score;
             details << query.index << ',' << query.raw.time << ',' << (query.validation ? "validation" : "train")
                     << ',' << candidate.stamp_shift_s*1000 << ',' << (param.imu_time_offset_s-candidate.stamp_shift_s)*1000
@@ -195,6 +220,13 @@ livo::ImuTimeOffsetResult EstimateImuTimeOffset(
                        << " balanced_score=" << Policy::BalancedScore(total);
     }
     if (!details || !curve) throw std::runtime_error("cannot write IMU offset matching diagnostics");
+    const auto scoring_end=std::chrono::steady_clock::now();
+    Json::Value timing;
+    timing["workers"]=param.workers;
+    timing["reference_registration_and_deskew_s"]=std::chrono::duration<double>(maps_start-reference_start).count();
+    timing["frozen_query_maps_s"]=std::chrono::duration<double>(scoring_start-maps_start).count();
+    timing["candidate_scoring_s"]=std::chrono::duration<double>(scoring_end-scoring_start).count();
+    std::ofstream(diagnostics/"imu_time_offset_timing.json")<<timing<<'\n';
     auto out = Policy::Estimate(std::move(scores),param.imu_time_offset_s);
     out.scans = full.size(); out.window_s = last-begin;
     out.window_begin_s = begin; out.window_end_s = last;

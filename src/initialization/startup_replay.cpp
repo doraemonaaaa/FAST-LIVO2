@@ -101,6 +101,14 @@ void StartupReplay::observeMeasurement(const LidarMeasureGroup &group)
              << current.points << ',' << current.images << ',' << current.fingerprint << '\n' << std::flush;
 }
 
+void StartupReplay::reportProgress()
+{
+  // Scoring consumes no new frames; keep the offline drain detector informed.
+  if(pending())log_ << std::setprecision(17) << "processing," << begin_ << ','
+                   << (indices_.empty()?end_:indices_.back().end) << ','
+                   << indices_.size() << ',' << bytes_ << '\n' << std::flush;
+}
+
 void StartupReplay::prepareNextInput(LidarMeasureGroup &group) const
 {
   // Initialization can leave the synchronization cursor unchanged when the
@@ -129,8 +137,10 @@ void StartupReplay::afterUpdate(LIVMapper &mapper)
   if(!stages_.advance(mapper))return;
   end_=mapper.LidarMeasures.last_lio_update_time;
   std::map<uint64_t,sensor_msgs::Imu::ConstPtr> ordered;
-  for (const auto &imu : imu_samples_)
-    if (imu->header.stamp.toSec()<=end_) ordered.emplace(imu->header.stamp.toNSec(),imu);
+  for(const auto& imu:imu_samples_) {
+    ordered.emplace(imu->header.stamp.toNSec(),imu);
+    if(imu->header.stamp.toSec()>=end_)break;
+  }
   std::deque<sensor_msgs::Imu::ConstPtr> samples;
   for (const auto &item : ordered)
   { if (item.second->header.stamp.toSec()<=begin_) samples.clear(); samples.push_back(item.second); }

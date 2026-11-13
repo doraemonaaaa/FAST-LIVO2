@@ -1,4 +1,5 @@
 #include "LIVMapper.h"
+#include "imu_support.h"
 #include "livo_time_cut.h"
 #include "camera_events.h"
 #include "pending_cloud.h"
@@ -15,7 +16,8 @@ bool LIVMapper::prepareCameraEvent(double &timestamp,double sensor_time)
   for(size_t k=0;k<camera_queues.size();++k) {
     auto &q=camera_queues[k];
     while(!q.times.empty() && (q.times.front()<LidarMeasures.last_lio_update_time || q.stamps.front()<last_camera_event_stamp ||
-          (eof && q.times.front()>sensor_time))) {
+          (eof && q.times.front()>sensor_time) ||
+          (q.times.front()<=last_timestamp_imu && imu_support::Check(scan_imu_history,q.times.front(),q.times.front())!=imu_support::Coverage::Covered))) {
       camera_input_log<<vio_manager->cameras[k]->id<<','<<q.stamps.front()<<','
           <<(q.times.front()<LidarMeasures.last_lio_update_time || q.stamps.front()<last_camera_event_stamp?"before_state":"outside_sensor_coverage")<<'\n'<<std::flush;
       q.times.pop_front();q.images.pop_front();q.stamps.pop_front();
@@ -45,11 +47,11 @@ bool LIVMapper::syncCameraEvent(LidarMeasureGroup &meas)
     sig_buffer.notify_all();return true;
   }
   if(meas.last_lio_update_time<0) {
-    if(lid_header_time_buffer.empty())return false;
+    if(lid_header_time_buffer.empty() || !imu_checked_scans)return false;
     meas.last_lio_update_time=lid_header_time_buffer.front();
   }
-  if(!lid_raw_data_buffer.empty())camera_lidar_coverage=std::max(camera_lidar_coverage,
-      lid_header_time_buffer.back()+lid_raw_data_buffer.back()->points.back().curvature/1000.);
+  if(imu_checked_scans)camera_lidar_coverage=std::max(camera_lidar_coverage,
+      lid_header_time_buffer[imu_checked_scans-1]+lid_raw_data_buffer[imu_checked_scans-1]->points.back().curvature*.001);
   const double coverage=std::min(camera_lidar_coverage,last_timestamp_imu);
   double timestamp;
   if(!prepareCameraEvent(timestamp,coverage))return false;
@@ -100,7 +102,7 @@ MeasureGroup LIVMapper::collectLivoSlice(LidarMeasureGroup &meas,double img_capt
   meas.pcl_proc_next->reserve(max_size);
   // deque<PointCloudXYZI::Ptr> lidar_buffer_tmp;
 
-  while (!lid_raw_data_buffer.empty())
+  while (!lid_raw_data_buffer.empty() && (!imu_en || imu_checked_scans))
   {
     if (lid_header_time_buffer.front() > img_capture_time) break;
     auto pcl(lid_raw_data_buffer.front()->points);
@@ -121,8 +123,7 @@ MeasureGroup LIVMapper::collectLivoSlice(LidarMeasureGroup &meas,double img_capt
         meas.pcl_proc_next->points.push_back(pt);
       }
     }
-    lid_raw_data_buffer.pop_front();
-    lid_header_time_buffer.pop_front();
+    consumeLidarFront();
   }
 
   // Individually sorted scans can overlap in time. Deskew requires the
@@ -152,6 +153,7 @@ void LIVMapper::processSequentialVIO(bool visual_support)
     MeasureGroup m;m.lio_time=timestamp;m.vio_time=timestamp;
     while(imu_index<measurement.imu.size() && measurement.imu[imu_index]->header.stamp.toSec()<=timestamp)
       m.imu.push_back(measurement.imu[imu_index++]);
+    if(imu_index<measurement.imu.size())m.imu.push_back(measurement.imu[imu_index]);
     vector<double> point_times;
     while(point_index<points.size() &&
           (timestamp==measurement.vio_time || points[point_index].curvature*.001<=timestamp-origin)) {
@@ -191,6 +193,6 @@ void LIVMapper::processSequentialVIO(bool visual_support)
   }
   else
     for(size_t i:cameraEventOrder(measurement.images))advance(measurement.images[i].timestamp);
-  if(point_index!=points.size() || imu_index!=measurement.imu.size())
+  if(point_index!=points.size() || (imu_index<measurement.imu.size() && measurement.imu[imu_index]->header.stamp.toSec()<=measurement.vio_time))
     throw std::runtime_error("Sequential bundle left unprocessed sensor input");
 }

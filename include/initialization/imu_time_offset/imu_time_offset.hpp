@@ -2,13 +2,18 @@
 
 #include "initialization/imu_time_offset/estimator.hpp"
 #include "initialization/input.h"
+#include "initialization/parallel.hpp"
 #include <filesystem>
+#include <functional>
 #include <json/json.h>
 
 namespace initialization {
 
 struct OffsetConfig {
     double imu_time_offset_s=0, initialization_acceleration_norm=9.81;
+    int workers=kDefaultInitializationThreads;
+    // Caller-thread callback; never invoke concurrently from a worker.
+    std::function<void()> progress;
 };
 // One immutable configured-clock state per temporary LIVO update. All offset
 // candidates use the same interpolated state at each query's reference epoch.

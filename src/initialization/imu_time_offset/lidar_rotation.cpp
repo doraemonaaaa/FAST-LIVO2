@@ -3,6 +3,8 @@
 #include <pcl/kdtree/kdtree_flann.h>
 #include <Eigen/Eigenvalues>
 #include <map>
+#include <memory>
+#include "initialization/parallel.hpp"
 
 namespace initialization { namespace imu_time_offset {
 using Matrix6 = Eigen::Matrix<double,6,6>;
@@ -116,32 +118,40 @@ RotationCloud DeskewRotationCloud(const RotationCloud& input, const LidarTwist& 
     return out;
 }
 
-// LiDAR-only point-to-plane alignment; no gyro prior and no IMU deskew.
-RotationFit RegisterRotation(const RotationCloud& target,
-                              const RotationCloud& source,
-                              const RotationFit& prediction) {
-    RotationFit out;
-    if (target.cloud->size() < 100 || source.cloud->size() < 100) return out;
+namespace {
+// One immutable target geometry per pair in a registration pass. Normal
+// estimation and every point-wise accumulation retain their original order.
+struct RegistrationTarget {
     pcl::KdTreeFLANN<PointType> tree;
-    tree.setInputCloud(target.cloud);
-    std::vector<V3D> normals(target.cloud->size(),V3D::Zero());
-    std::vector<V3D> centers(target.cloud->size(),V3D::Zero());
-    for (size_t i = 0; i < target.cloud->size(); ++i) {
-        std::vector<int> ids(12);std::vector<float> distances(12);
-        if (tree.nearestKSearch((*target.cloud)[i],12,ids,distances) != 12 ||
-            distances.back() > 2.25) continue;
-        V3D mean = V3D::Zero();
-        for (int id : ids) mean += (*target.cloud)[id].getVector3fMap().cast<double>();
-        mean /= 12.;M3D covariance = M3D::Zero();
-        for (int id : ids) {
-            const V3D d = (*target.cloud)[id].getVector3fMap().cast<double>()-mean;
-            covariance += d*d.transpose()/12.;
+    std::vector<V3D> normals, centers;
+    explicit RegistrationTarget(const RotationCloud& target)
+      : normals(target.cloud->size(),V3D::Zero()), centers(target.cloud->size(),V3D::Zero()) {
+        tree.setInputCloud(target.cloud);
+        for (size_t i = 0; i < target.cloud->size(); ++i) {
+            std::vector<int> ids(12);std::vector<float> distances(12);
+            if (tree.nearestKSearch((*target.cloud)[i],12,ids,distances) != 12 ||
+                distances.back() > 2.25) continue;
+            V3D mean = V3D::Zero();
+            for (int id : ids) mean += (*target.cloud)[id].getVector3fMap().cast<double>();
+            mean /= 12.;M3D covariance = M3D::Zero();
+            for (int id : ids) {
+                const V3D d = (*target.cloud)[id].getVector3fMap().cast<double>()-mean;
+                covariance += d*d.transpose()/12.;
+            }
+            Eigen::SelfAdjointEigenSolver<M3D> es(covariance);
+            if (es.eigenvalues()[1] < .005 || es.eigenvalues()[0] > .01 ||
+                es.eigenvalues()[0] > .15*es.eigenvalues()[1]) continue;
+            normals[i] = es.eigenvectors().col(0);centers[i] = mean;
         }
-        Eigen::SelfAdjointEigenSolver<M3D> es(covariance);
-        if (es.eigenvalues()[1] < .005 || es.eigenvalues()[0] > .01 ||
-            es.eigenvalues()[0] > .15*es.eigenvalues()[1]) continue;
-        normals[i] = es.eigenvectors().col(0);centers[i] = mean;
     }
+};
+
+RotationFit RegisterPreparedRotation(const RegistrationTarget& geometry,
+    const RotationCloud& source, const RotationFit& prediction) {
+    RotationFit out;
+    const auto& tree=geometry.tree;
+    const auto& normals=geometry.normals;
+    const auto& centers=geometry.centers;
     M3D R = prediction.valid ? prediction.rotation : M3D::Identity();
     V3D t = prediction.valid ? prediction.translation : V3D::Zero();
     auto linearize = [&](Matrix6& H,Vector6& g,double& squared,size_t& count) {
@@ -190,4 +200,53 @@ RotationFit RegisterRotation(const RotationCloud& target,
     out.valid = true;out.rotation = R;out.translation = t;out.covariance = covariance;
     return out;
 }
-} }  // namespace initialization::imu_time_offset
+} // namespace
+
+// Single-pair callers keep the original behavior and rejection rules.
+RotationFit RegisterRotation(const RotationCloud& target,
+    const RotationCloud& source, const RotationFit& prediction) {
+    if(target.cloud->size()<100 || source.cloud->size()<100) return {};
+    const RegistrationTarget geometry(target);
+    return RegisterPreparedRotation(geometry,source,prediction);
+}
+
+std::vector<RotationFit> RegisterRotationPairs(
+    const std::vector<RotationCloud>& clouds,
+    const std::vector<RotationFit>& previous,int workers) {
+    return RegisterRotationPairs(clouds,previous,workers,{});
+}
+
+std::vector<RotationFit> RegisterRotationPairs(
+    const std::vector<RotationCloud>& clouds,
+    const std::vector<RotationFit>& previous,int workers,const std::vector<bool>& enabled) {
+    if(previous.size()!=clouds.size())
+        throw std::invalid_argument("registration prediction size mismatch");
+    if(!enabled.empty() && enabled.size()!=clouds.size())
+        throw std::invalid_argument("registration pair mask size mismatch");
+    const auto allowed=[&](size_t i) {return enabled.empty() || enabled[i];};
+    // Geometry depends only on this pass's frozen target clouds, including
+    // during the first pass whose pose initial guesses still form a chain.
+    std::vector<std::unique_ptr<RegistrationTarget>> targets(clouds.size());
+    ForEachInitializationTask(clouds.size(),workers,[&](size_t i) {
+        if(i && allowed(i) && clouds[i-1].cloud->size()>=100 && clouds[i].cloud->size()>=100)
+            targets[i]=std::make_unique<RegistrationTarget>(clouds[i-1]);
+    });
+    std::vector<RotationFit> next(clouds.size());
+    auto fit=[&](size_t i,const RotationFit& prediction) {
+        return targets[i] ? RegisterPreparedRotation(*targets[i],clouds[i],prediction)
+                          : RotationFit{};
+    };
+    // Valid previous-pass guesses make these pair solves independent.
+    ForEachInitializationTask(clouds.size(),workers,[&](size_t i) {
+        if(i && allowed(i) && previous[i].valid) next[i]=fit(i,previous[i]);
+    });
+    // Preserve the original fallback to the current pass's preceding result.
+    // It must run in index order after all independent jobs have completed.
+    for(size_t i=1;i<clouds.size();++i) if(allowed(i) && !previous[i].valid) {
+        auto prediction=previous[i];
+        if(i>1) prediction=next[i-1];
+        next[i]=fit(i,prediction);
+    }
+    return next;
+}
+} } // namespace initialization::imu_time_offset

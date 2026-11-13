@@ -8,15 +8,15 @@ bool LIVMapper::syncScanEvent(LidarMeasureGroup &meas)
 {
   bool eof=false;ros::param::get("/fast_livo/input_finished",eof);
   if(meas.last_lio_update_time<0) {
-    if(lid_header_time_buffer.empty())return false;
+    if(lid_header_time_buffer.empty() || !imu_checked_scans)return false;
     meas.last_lio_update_time=lid_header_time_buffer.front();
   }
   double end=std::numeric_limits<double>::infinity();
-  if(!lid_raw_data_buffer.empty()) {
+  if(!lid_raw_data_buffer.empty() && imu_checked_scans) {
     scan_begin=lid_header_time_buffer.front();
     end=scan_begin+lid_raw_data_buffer.front()->points.back().curvature*.001;
     camera_lidar_coverage=std::max(camera_lidar_coverage,
-      lid_header_time_buffer.back()+lid_raw_data_buffer.back()->points.back().curvature*.001);
+      lid_header_time_buffer[imu_checked_scans-1]+lid_raw_data_buffer[imu_checked_scans-1]->points.back().curvature*.001);
   }
   const double coverage=std::min(camera_lidar_coverage,last_timestamp_imu);
   double image_time;
@@ -39,7 +39,7 @@ bool LIVMapper::syncScanEvent(LidarMeasureGroup &meas)
   if(scan_ready && (!image_ready || end<=image_time)) {
     std::lock_guard<std::mutex> lock(mtx_buffer);
     *meas.pcl_proc_cur=*lid_raw_data_buffer.front();
-    lid_raw_data_buffer.pop_front();lid_header_time_buffer.pop_front();
+    consumeLidarFront();
     meas.last_lio_update_time=scan_begin; // Raw point offsets use this scan's origin.
     m.lio_time=end;m.vio_time=end;meas.lio_vio_flg=LIO;
     sequential_anchor_event=false;pending_images.clear();
@@ -75,13 +75,7 @@ void LIVMapper::processScanImu()
     if(lidar) {
       deque<sensor_msgs::Imu::ConstPtr> samples;
       const double end=LidarMeasures.measures.back().lio_time;
-      {
-        std::lock_guard<std::mutex> lock(mtx_buffer);
-        while(scan_imu_history.size()>1 && scan_imu_history[1]->header.stamp.toSec()<=scan_begin)
-          scan_imu_history.pop_front();
-        for(const auto &sample:scan_imu_history)
-          if(sample->header.stamp.toSec()<=end)samples.push_back(sample);
-      }
+      samples=imuBracket(scan_begin,end);
       scan_audit<<std::setprecision(17)<<scan_begin<<','<<end<<','<<LidarMeasures.pcl_proc_cur->size()<<','<<samples.size()<<','
         <<_state.vel_end.norm()<<','<<_state.bias_g.norm()<<','<<_state.bias_a.norm()<<','<<_state.gravity.norm()<<'\n'<<std::flush;
       p_imu->deskewWholeScan(*LidarMeasures.pcl_proc_cur,scan_begin,end,_state,samples,feats_undistort);

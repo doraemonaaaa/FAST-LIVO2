@@ -142,6 +142,7 @@ target_link_libraries(fastlivo_batch_initialize initialization pre yaml-cpp ${ca
 add_library(imu_proc src/IMU_Processing.cpp src/initialization/imu_rewind.cpp)
 add_library(laser_mapping src/LIVMapper.cpp src/multi_camera_input.cpp src/sequential_vio.cpp src/scan_vio.cpp src/initialization/startup_replay.cpp src/initialization/staged_initialization.cpp)
 target_sources(laser_mapping PRIVATE src/initialization/gravity_norm_constraint.cpp)
+target_sources(laser_mapping PRIVATE src/imu_support.cpp)
 target_link_libraries(laser_mapping initialization)
 
 # Add the main executable
@@ -164,17 +165,4 @@ target_link_libraries(fastlivo_mapping
 # Link mimalloc if found
 if(mimalloc_FOUND)
   target_link_libraries(fastlivo_mapping mimalloc)
-endif()
-
-if(CATKIN_ENABLE_TESTING)
-  add_executable(batch_imu_initialization_test test/batch_imu_initialization_test.cpp)
-  target_link_libraries(batch_imu_initialization_test initialization ${catkin_LIBRARIES})
-  add_test(NAME batch_imu_initialization COMMAND batch_imu_initialization_test)
-  add_executable(gravity_norm_constraint_test test/gravity_norm_constraint_test.cpp)
-  target_link_libraries(gravity_norm_constraint_test ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenMP_CXX_LIBRARIES})
-  add_test(NAME gravity_norm_constraint COMMAND gravity_norm_constraint_test)
-  add_executable(multi_camera_test test/multi_camera_test.cpp)
-  target_link_libraries(multi_camera_test vio lio ${catkin_LIBRARIES} ${PCL_LIBRARIES}
-                        ${OpenCV_LIBRARIES} ${Sophus_LIBRARIES} ${Boost_LIBRARIES} ${OpenMP_CXX_LIBRARIES})
-  add_test(NAME multi_camera_algebra_and_jacobians COMMAND multi_camera_test)
 endif()

@@ -25,6 +25,7 @@ public:
   void afterUpdate(LIVMapper &mapper);
   void restore(LIVMapper &mapper);
   void finish();
+  void reportProgress();
 private:
   StagedInitialization stages_;
   struct Index { double begin,end; uint64_t fingerprint; size_t points,images; int flag; };

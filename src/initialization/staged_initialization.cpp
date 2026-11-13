@@ -5,6 +5,8 @@
 
 void StagedInitialization::configure(ros::NodeHandle& nh) {
   nh.param<bool>("imu/staged_initialization",enabled_,false);
+  nh.param<int>("imu/initialization_threads",workers_,initialization::kDefaultInitializationThreads);
+  if(workers_<1)throw std::runtime_error("imu/initialization_threads must be positive");
   nh.param<std::string>("imu/staged_phase",phase_,"refine");
   nh.param<std::string>("imu/staged_seed_output",output_,"");
   if(enabled_ && (phase_!="window" && phase_!="refine"))
@@ -65,7 +67,9 @@ double StagedInitialization::chooseOffset(LIVMapper& mapper) {
   for(const auto& sample:imus_) {auto p=std::make_shared<initialization::ImuSample>(*sample);p->timestamp-=epoch;imu.push_back(p);}
   Eigen::Matrix4d extrinsic=Eigen::Matrix4d::Identity();extrinsic.topLeftCorner<3,3>()=mapper.extR;extrinsic.topRightCorner<3,1>()=mapper.extT;
   initialization::OffsetConfig config;config.imu_time_offset_s=mapper.imu_time_offset;
+  config.workers=workers_;
   config.initialization_acceleration_norm=mapper.p_imu->IMU_mean_acc_norm;
+  config.progress=[&mapper]{mapper.startup_replay.reportProgress();};
   const auto directory=std::filesystem::path(output_).parent_path();
   auto result=initialization::EstimateImuTimeOffset(scans,imu,config,extrinsic,directory,
     ready_-epoch,last_-epoch,snapshots);

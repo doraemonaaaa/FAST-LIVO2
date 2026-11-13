@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "IMU_Processing.h"
+#include "imu_support.h"
 #include "state_numerics.h"
 #include <stdexcept>
 #include <cstdlib>
@@ -301,34 +302,16 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   /*** add the imu of the last frame-tail to the of current frame-head ***/
   MeasureGroup &meas = lidar_meas.measures.back();
   // cout<<"meas.imu.size: "<<meas.imu.size()<<endl;
-  auto v_imu = meas.imu;
-  v_imu.push_front(last_imu);
-  const double &imu_beg_time = v_imu.front()->header.stamp.toSec();
-  const double &imu_end_time = v_imu.back()->header.stamp.toSec();
-  const double prop_beg_time = last_prop_end_time;
-  const double diagnostic_point_origin = lidar_meas.last_lio_update_time;
-  static std::ofstream diagnostic_chain([] {
-    const char *p = std::getenv("FLIVO_CHAIN_TRACE");
-    return p ? p : "";
-  }());
-  size_t diagnostic_first_point_transforms = 0;
-
-  // printf("[ IMU ] undistort input size: %zu \n", lidar_meas.pcl_proc_cur->points.size());
-  // printf("[ IMU ] IMU data sequence size: %zu \n", meas.imu.size());
-  // printf("[ IMU ] lidar_scan_index_now: %d \n", lidar_meas.lidar_scan_index_now);
-
-  const double prop_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
-
-  // Preserve the real sample timestamp across batches. Empty/single-sample
-  // batches still cover the requested interval using last-measurement hold.
-  const auto last_actual_imu = v_imu.back();
-  if (v_imu.size() < 3 && imu_end_time < prop_end_time)
-  {
-    sensor_msgs::Imu::Ptr held(new sensor_msgs::Imu(*last_actual_imu));
-    held->header.stamp.fromSec(prop_end_time);
-    v_imu.push_back(held);
-  }
-
+  auto acquired=meas.imu;
+  if(acquired.empty() || last_imu->header.stamp<acquired.front()->header.stamp)acquired.push_front(last_imu);
+  const double prop_beg_time=last_prop_end_time;
+  const double prop_end_time=lidar_meas.lio_vio_flg==LIO?meas.lio_time:meas.vio_time;
+  auto v_imu=imu_support::Clip(acquired,prop_beg_time,prop_end_time);
+  const auto last_interval_sample=v_imu.back();
+  const double imu_beg_time=imu_support::Time(v_imu.front()),imu_end_time=imu_support::Time(v_imu.back());
+  const double diagnostic_point_origin=lidar_meas.last_lio_update_time;
+  static std::ofstream diagnostic_chain([] {const char* p=std::getenv("FLIVO_CHAIN_TRACE");return p?p:"";}());
+  size_t diagnostic_first_point_transforms=0;
 
   /*** cut lidar point based on the propagation-start time and required
    * propagation-end time ***/
@@ -431,25 +414,8 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       angvel_avr -= state_inout.bias_g;
       acc_avr = acc_avr * G_m_s2 / IMU_mean_acc_norm - state_inout.bias_a;
 
-      if (head->header.stamp.toSec() < prop_beg_time)
-      {
-        // printf("00 \n");
-        dt = tail->header.stamp.toSec() - last_prop_end_time;
-        offs_t = tail->header.stamp.toSec() - prop_beg_time;
-      }
-      else if (i != v_imu.size() - 2)
-      {
-        // printf("11 \n");
-        dt = tail->header.stamp.toSec() - head->header.stamp.toSec();
-        offs_t = tail->header.stamp.toSec() - prop_beg_time;
-      }
-      else
-      {
-        // printf("22 \n");
-        dt = prop_end_time - head->header.stamp.toSec();
-        offs_t = prop_end_time - prop_beg_time;
-      }
-
+      dt=tail->header.stamp.toSec()-head->header.stamp.toSec();
+      offs_t=tail->header.stamp.toSec()-prop_beg_time;
       if (dt <= 0.0) continue;
       dt_all += dt;
       // printf("[ LIO Propagation ] dt: %lf \n", dt);
@@ -525,30 +491,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   state_inout.pos_end = pos_imu;
   state_inout.inv_expo_time = tau;
 
-  /*** calculated the pos and attitude prediction at the frame-end ***/
-  // if (imu_end_time>prop_beg_time)
-  // {
-  //   double note = prop_end_time > imu_end_time ? 1.0 : -1.0;
-  //   dt = note * (prop_end_time - imu_end_time);
-  //   state_inout.vel_end = vel_imu + note * acc_imu * dt;
-  //   state_inout.rot_end = R_imu * Exp(V3D(note * angvel_avr), dt);
-  //   state_inout.pos_end = pos_imu + note * vel_imu * dt + note * 0.5 *
-  //   acc_imu * dt * dt;
-  // }
-  // else
-  // {
-  //   double note = prop_end_time > prop_beg_time ? 1.0 : -1.0;
-  //   dt = note * (prop_end_time - prop_beg_time);
-  //   state_inout.vel_end = vel_imu + note * acc_imu * dt;
-  //   state_inout.rot_end = R_imu * Exp(V3D(note * angvel_avr), dt);
-  //   state_inout.pos_end = pos_imu + note * vel_imu * dt + note * 0.5 *
-  //   acc_imu * dt * dt;
-  // }
-
-  // cout<<"[ Propagation ] output state: "<<state_inout.vel_end.transpose() <<
-  // state_inout.pos_end.transpose()<<endl;
-
-  last_imu = last_actual_imu;
+  last_imu = last_interval_sample;
   last_prop_end_time = prop_end_time;
 
   double t1 = omp_get_wtime();
@@ -664,6 +607,13 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
   }
 
   MeasureGroup meas = lidar_meas.measures.back();
+  if(imu_need_init) {
+    auto samples=meas.imu.empty()?motion_imu_carry:meas.imu;
+    if(samples.empty()) {cur_pcl_un_->clear();return;}
+    if(!b_first_frame && last_imu->header.stamp<samples.front()->header.stamp)samples.push_front(last_imu);
+    const double end=lidar_meas.lio_vio_flg==LIO?meas.lio_time:meas.vio_time;
+    meas.imu=imu_support::Clip(samples,lidar_meas.last_lio_update_time,end);
+  }
 
   if (imu_need_init)
   {

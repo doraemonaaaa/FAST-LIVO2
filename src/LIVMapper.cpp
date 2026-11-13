@@ -11,6 +11,7 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include "imu_support.h"
 #include "flivo_trace.h"
 #include "livo_time_cut.h"
 #include "camera_projection.h"
@@ -261,6 +262,9 @@ void LIVMapper::initializeComponents()
 
 void LIVMapper::initializeFiles() 
 {
+  imu_coverage_log.open(std::string(ROOT_DIR)+"Log/imu_coverage.csv");
+  if(!imu_coverage_log)throw std::runtime_error("Cannot create IMU coverage audit");
+  imu_coverage_log<<"begin,end,points,status,reason,first_imu,last_imu\n"<<std::flush;
   startup_replay.initializeLog(std::string(ROOT_DIR) + "Log/initialization_replay.csv");
   initialization_diagnostics.initializeLog(std::string(ROOT_DIR) + "Log/initialization_diagnostics.csv");
   if (pcd_save_en && colmap_output_en)
@@ -884,12 +888,11 @@ void LIVMapper::standard_pcl_cbk(const sensor_msgs::PointCloud2::ConstPtr &msg)
   if (cur_head_time < last_timestamp_lidar)
   {
     ROS_ERROR("lidar loop back, clear buffer");
-    lid_raw_data_buffer.clear();
+    lid_raw_data_buffer.clear();lid_header_time_buffer.clear();imu_checked_scans=0;
   }
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
   p_pre->process(msg, ptr);
-  startup_replay.observeScan(*ptr,cur_head_time);
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -921,7 +924,7 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
   if (cur_head_time < last_timestamp_lidar)
   {
     ROS_ERROR("lidar loop back, clear buffer");
-    lid_raw_data_buffer.clear();
+    lid_raw_data_buffer.clear();lid_header_time_buffer.clear();imu_checked_scans=0;
   }
   // ROS_INFO("get point cloud at time: %.6f", msg->header.stamp.toSec());
   PointCloudXYZI::Ptr ptr(new PointCloudXYZI());
@@ -933,7 +936,6 @@ void LIVMapper::livox_pcl_cbk(const livox_ros_driver::CustomMsg::ConstPtr &msg_i
     return;
   }
 
-  startup_replay.observeScan(*ptr,cur_head_time);
   lid_raw_data_buffer.push_back(ptr);
   lid_header_time_buffer.push_back(cur_head_time);
   last_timestamp_lidar = cur_head_time;
@@ -983,7 +985,7 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstPtr &msg_in)
   last_timestamp_imu = timestamp;
 
   imu_buffer.push_back(msg);
-  if(scan_clock)scan_imu_history.push_back(msg);
+  scan_imu_history.push_back(msg);
   // cout<<"got imu: "<<timestamp<<" imu size "<<imu_buffer.size()<<endl;
   mtx_buffer.unlock();
   if (imu_prop_enable)
@@ -1004,14 +1006,14 @@ cv::Mat LIVMapper::getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg)
   return img;
 }
 
-bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
+bool LIVMapper::syncRawPackages(LidarMeasureGroup &meas)
 {
   if(slam_mode_==LIVO && scan_clock)return syncScanEvent(meas);
   if(slam_mode_==LIVO && sequential_camera_updates)return syncCameraEvent(meas);
   // A selected bundle has already passed sensor coverage checks. Complete its
   // VIO even if consuming LIO emptied a queue at EOF, in either update mode.
   const bool finishing_bundle=slam_mode_==LIVO && meas.lio_vio_flg==LIO;
-  if (lid_raw_data_buffer.empty() && lidar_en && !finishing_bundle) return false;
+  if ((lid_raw_data_buffer.empty() || (imu_en && !imu_checked_scans)) && lidar_en && !finishing_bundle) return false;
   if (imageBuffer().empty() && img_en) return false;
   if (imu_buffer.empty() && imu_en && !finishing_bundle) return false;
 
@@ -1051,8 +1053,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       m.imu.push_back(imu_buffer.front());
       imu_buffer.pop_front();
     }
-    lid_raw_data_buffer.pop_front();
-    lid_header_time_buffer.pop_front();
+    consumeLidarFront();
     mtx_buffer.unlock();
     sig_buffer.notify_all();
 
@@ -1087,7 +1088,8 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       // printf("[ Data Cut ] last_lio_update_time: %lf \n",
       // meas.last_lio_update_time);
 
-      double lid_newest_time = lid_header_time_buffer.back() + lid_raw_data_buffer.back()->points.back().curvature / double(1000);
+      const size_t last=imu_en?imu_checked_scans-1:lid_raw_data_buffer.size()-1;
+      double lid_newest_time=lid_header_time_buffer[last]+lid_raw_data_buffer[last]->points.back().curvature*.001;
       double imu_newest_time = imu_buffer.back()->header.stamp.toSec();
 
       if (img_capture_time < meas.last_lio_update_time + 0.00001)
@@ -1107,6 +1109,12 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
         return false;
       }
 
+      if(imu_en && imu_support::Check(scan_imu_history,img_capture_time,img_capture_time)!=imu_support::Coverage::Covered) {
+        camera_input_log<<vio_manager->cameras[vio_manager->anchor_index]->id<<','
+          <<camera_queues[vio_manager->anchor_index].stamps.front()<<",outside_sensor_coverage\n"<<std::flush;
+        imageBuffer().pop_front();imageTimes().pop_front();camera_queues[vio_manager->anchor_index].stamps.pop_front();
+        return false;
+      }
       if (!prepareImageBundle(img_capture_time)) return false;
       bundle_sequential_updates=false;
 
@@ -1178,8 +1186,7 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
     struct MeasureGroup m; // standard method to keep imu message.
     m.lio_time = meas.lidar_frame_end_time;
     mtx_buffer.lock();
-    lid_raw_data_buffer.pop_front();
-    lid_header_time_buffer.pop_front();
+    consumeLidarFront();
     mtx_buffer.unlock();
     sig_buffer.notify_all();
     lidar_pushed = false; // sync one whole lidar scan.

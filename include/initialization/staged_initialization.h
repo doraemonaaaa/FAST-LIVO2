@@ -14,6 +14,7 @@ private:
   std::ofstream states_;
   std::string phase_,output_;
   bool enabled_=false;
+  int workers_=initialization::kDefaultInitializationThreads;
   double last_=-1,ready_=-1;
   std::vector<initialization::LivoScan> scans_;
   std::vector<initialization::ImuSample::ConstPtr> imus_;

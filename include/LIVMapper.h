@@ -153,6 +153,14 @@ public:
   ofstream scan_audit;
   double scan_begin = 0;
   deque<sensor_msgs::Imu::ConstPtr> scan_imu_history;
+  size_t imu_checked_scans=0;
+  double last_sync_time=-1;
+  double last_lidar_support_begin=-1;
+  ofstream imu_coverage_log;
+  bool syncRawPackages(LidarMeasureGroup &meas);
+  void filterImuCoveredScans();
+  void consumeLidarFront();
+  deque<sensor_msgs::Imu::ConstPtr> imuBracket(double begin,double end) const;
   bool bundle_sequential_updates = false;
   bool sequential_anchor_event = false;
   double last_camera_event_time = -1;

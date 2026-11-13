@@ -13,6 +13,7 @@ which is included as part of this source code package.
 #include "vio.h"
 #include "camera_projection.h"
 #include "photometric_noise.h"
+#include "photometric_patch.h"
 #include "patch_score.h"
 #include "flivo_trace.h"
 
@@ -169,16 +170,11 @@ void VisualCamera::initializeVIO()
 
   patch_size_total = patch_size * patch_size;
   patch_size_half = static_cast<int>(patch_size / 2);
-  patch_buffer.resize(patch_size_total);
+  patch_buffer.resize(patch_size_total * (kMaxSearchLevel + 1));
   warp_len = patch_size_total * patch_pyrimid_level;
-  // updateState() reads a patch_size box around the point plus a 2*scale
-  // gradient stencil, i.e. (patch_size_half + 1) * scale in every direction,
-  // with scale = 1 << (level + search_level). level peaks at
-  // patch_pyrimid_level - 1 and search_level at kMaxSearchLevel, so the widest
-  // reach is (patch_size_half + 1) << (patch_pyrimid_level - 1 +
-  // kMaxSearchLevel). The original `1 << patch_pyrimid_level` assumed a maximum
-  // search level of 1 and admitted points half that distance from the edge,
-  // whose patches then read outside the image.
+  // Retain the conservative admission margin at the largest coarse/search
+  // stride. It covers the furthest patch sample and its adjacent interpolation
+  // neighbour; individual samples and gradients use original-pixel spacing.
   border = (patch_size_half + 1) * (1 << (patch_pyrimid_level - 1 + kMaxSearchLevel));
 
   retrieve_voxel_points.reserve(length);
@@ -221,26 +217,12 @@ bool VisualCamera::computeProjectionJacobian(V3D p, MD(2, 3) & J)
 
 void VisualCamera::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
 {
-  const float u_ref = pc[0];
-  const float v_ref = pc[1];
-  const int scale = (1 << level);
-  const int u_ref_i = floorf(pc[0] / scale) * scale;
-  const int v_ref_i = floorf(pc[1] / scale) * scale;
-  const float subpix_u_ref = (u_ref - u_ref_i) / scale;
-  const float subpix_v_ref = (v_ref - v_ref_i) / scale;
-  const float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
-  const float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
-  const float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
-  const float w_ref_br = subpix_u_ref * subpix_v_ref;
-  for (int x = 0; x < patch_size; x++)
-  {
-    uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i - patch_size_half * scale + x * scale) * width + (u_ref_i - patch_size_half * scale);
-    for (int y = 0; y < patch_size; y++, img_ptr += scale)
-    {
-      patch_tmp[patch_size_total * level + x * patch_size + y] =
-          w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] + w_ref_br * img_ptr[scale * width + scale];
-    }
-  }
+  const int scale = 1 << level;
+  for (int y = 0; y < patch_size; ++y)
+    for (int x = 0; x < patch_size; ++x)
+      patch_tmp[patch_size_total * level + y * patch_size + x] =
+          flivo::sampleGray(img, pc.x() + (x - patch_size_half)*scale,
+                                pc.y() + (y - patch_size_half)*scale).value;
 }
 
 void VisualCamera::insertPointIntoVoxelMap(VisualPoint *pt_new)
@@ -312,7 +294,7 @@ void VisualCamera::warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref,
                                const int pyramid_level, const int halfpatch_size, float *patch)
 {
   const int patch_size = halfpatch_size * 2;
-  const Matrix2f A_ref_cur = A_cur_ref.inverse().cast<float>();
+  const Matrix2d A_ref_cur = A_cur_ref.inverse();
   if (isnan(A_ref_cur(0, 0)))
   {
     printf("Affine warp is NaN, probably camera has no translation\n"); // TODO
@@ -324,14 +306,14 @@ void VisualCamera::warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref,
   {
     for (int x = 0; x < patch_size; ++x) //, ++patch_ptr)
     {
-      Vector2f px_patch(x - halfpatch_size, y - halfpatch_size);
+      Vector2d px_patch(x - halfpatch_size, y - halfpatch_size);
       px_patch *= (1 << search_level);
       px_patch *= (1 << pyramid_level);
-      const Vector2f px(A_ref_cur * px_patch + px_ref.cast<float>());
+      const Vector2d px(A_ref_cur * px_patch + px_ref);
       if (px[0] < 0 || px[1] < 0 || px[0] >= img_ref.cols - 1 || px[1] >= img_ref.rows - 1)
         patch_ptr[patch_size_total * pyramid_level + y * patch_size + x] = 0;
       else
-        patch_ptr[patch_size_total * pyramid_level + y * patch_size + x] = (float)vk::interpolateMat_8u(img_ref, px[0], px[1]);
+        patch_ptr[patch_size_total * pyramid_level + y * patch_size + x] = flivo::sampleGray(img_ref, px[0], px[1]).value;
     }
   }
 }
@@ -692,10 +674,8 @@ void VisualCamera::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar>
               if ((*itm)->id_ == ref_patch_temp->id_) continue;
               float *patch_cache = (*itm)->patch_;
 
-              for (int ind = 0; ind < patch_size_total; ind++)
-              {
-                phtometric_errors += (patch_temp[ind] - patch_cache[ind]) * (patch_temp[ind] - patch_cache[ind]);
-              }
+              phtometric_errors += flivo::centeredPatchError(patch_temp, patch_cache, patch_size_total,
+                  ref_patch_temp->inv_expo_time_, (*itm)->inv_expo_time_);
               count++;
             }
             phtometric_errors = phtometric_errors / count;
@@ -760,24 +740,21 @@ void VisualCamera::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar>
         warpAffine(A_cur_ref_zero, ref_ftr->img_, ref_ftr->px_, ref_ftr->level_, search_level, pyramid_level, patch_size_half, patch_wrap.data());
       }
 
-      getImagePatch(img, pc, patch_buffer.data(), 0);
+      getImagePatch(img, pc, patch_buffer.data(), search_level);
+      float *current_patch = patch_buffer.data() + patch_size_total * search_level;
 
       // The forward update uses this same per-frame noise normalization.
       // The legacy inverse-compositional path uses a separate raw-image cost.
       const double noise_weight = inverse_composition_en ? 1.0 :
           flivo::photometricSqrtInformation(state->exposure(camera_index), ref_ftr->inv_expo_time_);
       if (noise_weight == 0.0) continue;
-      float error = 0.0;
-      for (int ind = 0; ind < patch_size_total; ind++)
-      {
-        const double residual = noise_weight *
-            (ref_ftr->inv_expo_time_ * patch_wrap[ind] - state->exposure(camera_index) * patch_buffer[ind]);
-        error += residual * residual;
-      }
+      const double error = flivo::centeredPatchError(patch_wrap.data(), current_patch, patch_size_total,
+          inverse_composition_en ? 1.0 : ref_ftr->inv_expo_time_,
+          inverse_composition_en ? 1.0 : state->exposure(camera_index), noise_weight);
 
       if (ncc_en)
       {
-        double ncc = calculateNCC(patch_wrap.data(), patch_buffer.data(), patch_size_total);
+        double ncc = calculateNCC(patch_wrap.data(), current_patch, patch_size_total);
         if (ncc < ncc_thre)
         {
           // grid_num[i] = TYPE_UNKNOWN;
@@ -1145,7 +1122,7 @@ void VisualCamera::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, 
       Matrix2d A_cur_ref;
       getWarpMatrixAffineHomography(*cam, ref_ftr->px_, pf, norm_vec, T_cur_ref, 0, A_cur_ref);
 
-      // const Matrix2f A_ref_cur = A_cur_ref.inverse().cast<float>();
+      // const Matrix2d A_ref_cur = A_cur_ref.inverse();
       int search_level = getBestSearchLevel(A_cur_ref.inverse(), kMaxSearchLevel);
 
       double D = A_cur_ref.determinant();
@@ -1322,70 +1299,37 @@ void VisualCamera::projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, 
 
 void VisualCamera::precomputeReferencePatches(int level)
 {
-  double t1 = omp_get_wtime();
-  if (total_points == 0) return;
-  MD(1, 2) Jimg;
-  MD(2, 3) Jdpi;
-  MD(1, 3) Jdphi, Jdp, JdR, Jdt;
-
-  const int H_DIM = total_points * patch_size_total;
-
-  H_sub_inv.resize(H_DIM, 6);
-  H_sub_inv.setZero();
-  M3D p_w_hat;
-
-  for (int i = 0; i < total_points; i++)
+  H_sub_inv = MatrixXd::Zero(total_points * patch_size_total, 6);
+  for (int i = 0; i < total_points; ++i)
   {
-    const int scale = (1 << level);
-
     VisualPoint *pt = visual_submap->voxel_points[i];
     if (pt == nullptr || pt->referencePatch(camera_index) == nullptr) continue;
-    cv::Mat img = pt->referencePatch(camera_index)->img_;
-
-    double depth((pt->pos_ - pt->referencePatch(camera_index)->pos()).norm());
-    V3D pf = pt->referencePatch(camera_index)->f_ * depth;
-    V2D pc = pt->referencePatch(camera_index)->px_;
-    M3D R_ref_w = pt->referencePatch(camera_index)->T_f_w_.rotation_matrix();
-
+    const Feature *reference = pt->referencePatch(camera_index);
+    const cv::Mat &img = reference->img_;
+    const int scale = 1 << (level + visual_submap->search_levels[i]);
+    const V2D pc = reference->px_;
+    const int reach = (patch_size_half + 1) * scale;
+    if (pc.x() - reach < 0 || pc.x() + reach >= img.cols ||
+        pc.y() - reach < 0 || pc.y() + reach >= img.rows) continue;
+    const V3D pf = reference->f_ * (pt->pos_ - reference->pos()).norm();
+    MD(2, 3) Jdpi;
     if (!computeProjectionJacobian(pf, Jdpi)) continue;
+    const M3D R_ref_w = reference->T_f_w_.rotation_matrix();
+    M3D p_w_hat;
     p_w_hat << SKEW_SYM_MATRX(pt->pos_);
-
-    const float u_ref = pc[0];
-    const float v_ref = pc[1];
-    const int u_ref_i = floorf(pc[0] / scale) * scale;
-    const int v_ref_i = floorf(pc[1] / scale) * scale;
-    const float subpix_u_ref = (u_ref - u_ref_i) / scale;
-    const float subpix_v_ref = (v_ref - v_ref_i) / scale;
-    const float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
-    const float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
-    const float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
-    const float w_ref_br = subpix_u_ref * subpix_v_ref;
-
-    for (int x = 0; x < patch_size; x++)
-    {
-      uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
-      for (int y = 0; y < patch_size; ++y, img_ptr += scale)
+    for (int y = 0; y < patch_size; ++y)
+      for (int x = 0; x < patch_size; ++x)
       {
-        float du =
-            0.5f *
-            ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * width + scale] +
-              w_ref_br * img_ptr[scale * width + scale * 2]) -
-             (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * width - scale] + w_ref_br * img_ptr[scale * width]));
-        float dv =
-            0.5f *
-            ((w_ref_tl * img_ptr[scale * width] + w_ref_tr * img_ptr[scale + scale * width] + w_ref_bl * img_ptr[width * scale * 2] +
-              w_ref_br * img_ptr[width * scale * 2 + scale]) -
-             (w_ref_tl * img_ptr[-scale * width] + w_ref_tr * img_ptr[-scale * width + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
-
-        Jimg << du, dv;
-        Jimg = Jimg * (1.0 / scale);
-
-        JdR = Jimg * Jdpi * R_ref_w * p_w_hat;
-        Jdt = -Jimg * Jdpi * R_ref_w;
-
-        H_sub_inv.block<1, 6>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt;
+        const auto sample = flivo::sampleGray(img, pc.x() + (x - patch_size_half)*scale,
+                                                  pc.y() + (y - patch_size_half)*scale);
+        MD(1, 2) Jimg;
+        Jimg << sample.dx, sample.dy;
+        H_sub_inv.block<1, 3>(i*patch_size_total + y*patch_size + x, 0) = Jimg * Jdpi * R_ref_w * p_w_hat;
+        H_sub_inv.block<1, 3>(i*patch_size_total + y*patch_size + x, 3) = -Jimg * Jdpi * R_ref_w;
       }
-    }
+    auto rows = H_sub_inv.middleRows(i*patch_size_total, patch_size_total);
+    const Eigen::RowVectorXd mean_H = rows.colwise().mean();
+    rows.rowwise() -= mean_H;
   }
   has_ref_patch_cache = true;
 }
@@ -1393,196 +1337,105 @@ void VisualCamera::precomputeReferencePatches(int level)
 void VisualCamera::buildInverseResiduals(cv::Mat img, int level, MatrixXd &H_sub, VectorXd &z,
                                         vector<float> &errors, vector<int> &counts)
 {
-  V2D pc;
-  MD(1,3) JdR, Jdt;
+  if (!has_ref_patch_cache) precomputeReferencePatches(level);
+  const M3D Rwi = state->rot_end;
   M3D P_wi_hat;
-    if (has_ref_patch_cache == false) precomputeReferencePatches(level);
-    M3D Rwi(state->rot_end);
-    V3D Pwi(state->pos_end);
-    P_wi_hat << SKEW_SYM_MATRX(Pwi);
-    Rcw = Rci * Rwi.transpose();
-    Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
-
-    M3D p_hat;
-
-    for (int i = 0; i < total_points; i++)
-    {
-      float patch_error = 0.0;
-
-      const int scale = (1 << level);
-
-      VisualPoint *pt = visual_submap->voxel_points[i];
-
-      if (pt == nullptr || noise_weights[i] == 0) continue;
-
-      V3D pf = Rcw * pt->pos_ + Pcw;
-      if (!flivo::validProjectionRay(pf) ||
-          H_sub_inv.middleRows(i * patch_size_total, patch_size_total).isZero(0)) continue;
-      pc = cam->world2cam(pf);
-      if (!pc.allFinite()) continue;
-
-      const float u_ref = pc[0];
-      const float v_ref = pc[1];
-      const int u_ref_i = floorf(pc[0] / scale) * scale;
-      const int v_ref_i = floorf(pc[1] / scale) * scale;
-      const int reach = (patch_size_half + 1) * scale;
-      if (u_ref_i - reach < 0 || u_ref_i + reach >= width ||
-          v_ref_i - reach < 0 || v_ref_i + reach >= height) continue;
-      const float subpix_u_ref = (u_ref - u_ref_i) / scale;
-      const float subpix_v_ref = (v_ref - v_ref_i) / scale;
-      const float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
-      const float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
-      const float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
-      const float w_ref_br = subpix_u_ref * subpix_v_ref;
-
-      vector<float> P = visual_submap->warp_patch[i];
-      for (int x = 0; x < patch_size; x++)
+  P_wi_hat << SKEW_SYM_MATRX(state->pos_end);
+  Rcw = Rci * Rwi.transpose();
+  Pcw = -Rcw * state->pos_end + Pci;
+  std::fill(errors.begin(), errors.end(), 0.0f);
+  std::fill(counts.begin(), counts.end(), 0);
+  for (int i = 0; i < total_points; ++i)
+  {
+    VisualPoint *pt = visual_submap->voxel_points[i];
+    if (pt == nullptr || noise_weights[i] == 0) continue;
+    const V3D pf = Rcw * pt->pos_ + Pcw;
+    if (!flivo::validProjectionRay(pf) ||
+        H_sub_inv.middleRows(i*patch_size_total, patch_size_total).isZero(0)) continue;
+    const V2D pc = cam->world2cam(pf);
+    const int scale = 1 << (level + visual_submap->search_levels[i]);
+    const int reach = (patch_size_half + 1) * scale;
+    if (!pc.allFinite() || pc.x() - reach < 0 || pc.x() + reach >= img.cols ||
+        pc.y() - reach < 0 || pc.y() + reach >= img.rows) continue;
+    const auto &P = visual_submap->warp_patch[i];
+    for (int y = 0; y < patch_size; ++y)
+      for (int x = 0; x < patch_size; ++x)
       {
-        uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
-        for (int y = 0; y < patch_size; ++y, img_ptr += scale)
-        {
-          double res = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] +
-                       w_ref_br * img_ptr[scale * width + scale] - P[patch_size_total * level + x * patch_size + y];
-          z(i * patch_size_total + x * patch_size + y) = res;
-          patch_error += res * res;
-          MD(1, 3) J_dR = H_sub_inv.block<1, 3>(i * patch_size_total + x * patch_size + y, 0);
-          MD(1, 3) J_dt = H_sub_inv.block<1, 3>(i * patch_size_total + x * patch_size + y, 3);
-          JdR = J_dR * Rwi + J_dt * P_wi_hat * Rwi;
-          Jdt = J_dt * Rwi;
-          H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt;
-          counts[i]++;
-        }
+        const int row = i*patch_size_total + y*patch_size + x;
+        const double value = flivo::sampleGray(img, pc.x() + (x - patch_size_half)*scale,
+                                                  pc.y() + (y - patch_size_half)*scale).value;
+        z(row) = value - P[patch_size_total*level + y*patch_size + x];
+        const MD(1, 3) J_dR = H_sub_inv.block<1, 3>(row, 0);
+        const MD(1, 3) J_dt = H_sub_inv.block<1, 3>(row, 3);
+        H_sub.block<1, 3>(row, 0) = J_dR*Rwi + J_dt*P_wi_hat*Rwi;
+        H_sub.block<1, 3>(row, 3) = J_dt*Rwi;
       }
-      visual_submap->errors[i] = patch_error;
-      errors[i] = patch_error;
-    }
-
+    errors[i] = flivo::centerPatchSystem(H_sub, z, i*patch_size_total, patch_size_total);
+    visual_submap->errors[i] = errors[i];
+    counts[i] = patch_size_total;
+  }
 }
 
 void VisualCamera::buildResiduals(cv::Mat img, int level, const vector<double> &noise_weights,
                                  MatrixXd &H_sub, VectorXd &z, vector<float> &errors, vector<int> &counts)
 {
-    M3D Rwi(state->rot_end);
-    V3D Pwi(state->pos_end);
-    Rcw = Rci * Rwi.transpose();
-    Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
-    Jdp_dt = Rci * Rwi.transpose();
-    
-    std::fill(errors.begin(), errors.end(), 0.0f);
-    std::fill(counts.begin(), counts.end(), 0);
-    // int max_threads = omp_get_max_threads();
-    // int desired_threads = std::min(max_threads, total_points);
-    // omp_set_num_threads(desired_threads);
-
-    #ifdef MP_EN
-      omp_set_num_threads(MP_PROC_NUM);
-      #pragma omp parallel for
-    #endif
-    for (int i = 0; i < total_points; i++)
+  const M3D Rwi = state->rot_end;
+  Rcw = Rci * Rwi.transpose();
+  Pcw = -Rcw * state->pos_end + Pci;
+  Jdp_dt = Rcw;
+  std::fill(errors.begin(), errors.end(), 0.0f);
+  std::fill(counts.begin(), counts.end(), 0);
+  #ifdef MP_EN
+    omp_set_num_threads(MP_PROC_NUM);
+    #pragma omp parallel for
+  #endif
+  for (int i = 0; i < total_points; ++i)
+  {
+    VisualPoint *pt = visual_submap->voxel_points[i];
+    if (pt == nullptr || noise_weights[i] == 0) continue;
+    const V3D pf = Rcw * pt->pos_ + Pcw;
+    MD(2, 3) Jdpi;
+    if (!computeProjectionJacobian(pf, Jdpi)) continue;
+    const V2D pc = cam->world2cam(pf);
+    if (!pc.allFinite()) continue;
+    const int scale = 1 << (level + visual_submap->search_levels[i]);
+    // Keep the conservative patch admission border, including gradient reach.
+    const int reach = (patch_size_half + 1) * scale;
+    if (pc.x() - reach < 0 || pc.x() + reach >= img.cols ||
+        pc.y() - reach < 0 || pc.y() + reach >= img.rows)
     {
-      // printf("thread is %d, i=%d, i address is %p\n", omp_get_thread_num(), i, &i);
-      MD(1, 2) Jimg;
-      MD(2, 3) Jdpi;
-      MD(1, 3) Jdphi, Jdp, JdR, Jdt;
-
-      float patch_error = 0.0;
-      int patch_n_meas = 0;
-      int search_level = visual_submap->search_levels[i];
-      int pyramid_level = level + search_level;
-      int scale = (1 << pyramid_level);
-      float inv_scale = 1.0f / scale;
-
-      VisualPoint *pt = visual_submap->voxel_points[i];
-
-      if (pt == nullptr || noise_weights[i] == 0) continue;
-
-      V3D pf = Rcw * pt->pos_ + Pcw;
-      if (!computeProjectionJacobian(pf, Jdpi)) continue;
-      V2D pc = cam->world2cam(pf);
-      if (!pc.allFinite()) continue;
-      M3D p_hat;
-      p_hat << SKEW_SYM_MATRX(pf);
-
-      float u_ref = pc[0];
-      float v_ref = pc[1];
-      int u_ref_i = floorf(pc[0] / scale) * scale;
-      int v_ref_i = floorf(pc[1] / scale) * scale;
-      float subpix_u_ref = (u_ref - u_ref_i) / scale;
-      float subpix_v_ref = (v_ref - v_ref_i) / scale;
-      float w_ref_tl = (1.0 - subpix_u_ref) * (1.0 - subpix_v_ref);
-      float w_ref_tr = subpix_u_ref * (1.0 - subpix_v_ref);
-      float w_ref_bl = (1.0 - subpix_u_ref) * subpix_v_ref;
-      float w_ref_br = subpix_u_ref * subpix_v_ref;
-
-      {
-        // Defence in depth for the reach `border` is sized from in
-        // initializeVIO(). The loop below walks img.data by raw pointer
-        // arithmetic over (patch_size_half + 1) * scale pixels in every
-        // direction, so a point admitted with too small a border reads outside
-        // the image, or wraps into the neighbouring row. Those bytes are
-        // unrelated heap contents that differ run to run and flip the
-        // `error <= last_error` accept/reject test below. With the corrected
-        // border this never triggers; flivo_oob_count is the assertion.
-        const int reach = (patch_size_half + 1) * scale;
-        if (u_ref_i - reach < 0 || u_ref_i + reach >= width ||
-            v_ref_i - reach < 0 || v_ref_i + reach >= height)
-        {
-          #pragma omp atomic
-          flivo_oob_count++;
-          continue;
-        }
-        #pragma omp atomic
-        flivo_patch_count++;
-      }
-
-      vector<float> P = visual_submap->warp_patch[i];
-      double inv_ref_expo = visual_submap->inv_expo_list[i];
-      const double noise_weight = noise_weights[i];
-      if (noise_weight == 0.0) continue;
-      // ROS_ERROR("inv_ref_expo: %.3lf, state->exposure(camera_index): %.3lf\n", inv_ref_expo, state->exposure(camera_index));
-
-      for (int x = 0; x < patch_size; x++)
-      {
-        uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
-        for (int y = 0; y < patch_size; ++y, img_ptr += scale)
-        {
-          float du =
-              0.5f *
-              ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * width + scale] +
-                w_ref_br * img_ptr[scale * width + scale * 2]) -
-               (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * width - scale] + w_ref_br * img_ptr[scale * width]));
-          float dv =
-              0.5f *
-              ((w_ref_tl * img_ptr[scale * width] + w_ref_tr * img_ptr[scale + scale * width] + w_ref_bl * img_ptr[width * scale * 2] +
-                w_ref_br * img_ptr[width * scale * 2 + scale]) -
-               (w_ref_tl * img_ptr[-scale * width] + w_ref_tr * img_ptr[-scale * width + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
-
-          Jimg << du, dv;
-          Jimg = Jimg * (state->exposure(camera_index) * noise_weight);
-          Jimg = Jimg * inv_scale;
-          Jdphi = Jimg * Jdpi * p_hat;
-          Jdp = -Jimg * Jdpi;
-          JdR = Jdphi * Jdphi_dR + Jdp * Jdp_dR;
-          Jdt = Jdp * Jdp_dt;
-
-          double cur_value =
-              w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] + w_ref_br * img_ptr[scale * width + scale];
-          double res = noise_weight * (state->exposure(camera_index) * cur_value - inv_ref_expo * P[patch_size_total * level + x * patch_size + y]);
-
-          z(i * patch_size_total + x * patch_size + y) = res;
-
-          patch_error += res * res;
-          patch_n_meas += 1;
-
-          if (exposure_estimate_en) { H_sub.block<1, 7>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt, noise_weight * cur_value; }
-          else { H_sub.block<1, 6>(i * patch_size_total + x * patch_size + y, 0) << JdR, Jdt; }
-        }
-      }
-      visual_submap->errors[i] = patch_error;
-      errors[i] = patch_error;
-      counts[i] = patch_n_meas;
+      #pragma omp atomic
+      flivo_oob_count++;
+      continue;
     }
-
+    #pragma omp atomic
+    flivo_patch_count++;
+    M3D p_hat;
+    p_hat << SKEW_SYM_MATRX(pf);
+    const auto &P = visual_submap->warp_patch[i];
+    const double reference_gain = visual_submap->inv_expo_list[i];
+    const double weight = noise_weights[i]; // Frozen for the entire frame.
+    const double gain = state->exposure(camera_index);
+    for (int y = 0; y < patch_size; ++y)
+      for (int x = 0; x < patch_size; ++x)
+      {
+        const auto sample = flivo::sampleGray(img, pc.x() + (x - patch_size_half)*scale,
+                                                  pc.y() + (y - patch_size_half)*scale);
+        MD(1, 2) Jimg;
+        Jimg << sample.dx, sample.dy;
+        Jimg *= gain * weight;
+        const MD(1, 3) Jdphi = Jimg * Jdpi * p_hat;
+        const MD(1, 3) Jdp = -Jimg * Jdpi;
+        const int row = i*patch_size_total + y*patch_size + x;
+        z(row) = weight*(gain*sample.value - reference_gain*P[patch_size_total*level + y*patch_size + x]);
+        H_sub.block<1, 3>(row, 0) = Jdphi*Jdphi_dR + Jdp*Jdp_dR;
+        H_sub.block<1, 3>(row, 3) = Jdp*Jdp_dt;
+        if (exposure_estimate_en) H_sub(row, 6) = weight*sample.value;
+      }
+    errors[i] = flivo::centerPatchSystem(H_sub, z, i*patch_size_total, patch_size_total);
+    visual_submap->errors[i] = errors[i];
+    counts[i] = patch_size_total;
+  }
 }
 
 void VisualCamera::updateFrameState(StatesGroup state)

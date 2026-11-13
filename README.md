@@ -108,3 +108,7 @@ rosbag play YOUR_DOWNLOADED.bag
 ## 5. License
 
 The source code of this package is released under the [**GPLv2**](http://www.gnu.org/licenses/) license. For commercial use, please contact me at <zhengcr@connect.hku.hk> and Prof. Fu Zhang at <fuzhang@hku.hk> to discuss an alternative license.
+
+## Local photometric patch corrections
+
+See [photometric_patch.md](photometric_patch.md) for the mean-centered brightness model, consistent coarse interpolation, and validation history.
