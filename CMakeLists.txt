@@ -143,6 +143,8 @@ add_library(imu_proc src/IMU_Processing.cpp src/initialization/imu_rewind.cpp)
 add_library(laser_mapping src/LIVMapper.cpp src/multi_camera_input.cpp src/sequential_vio.cpp src/scan_vio.cpp src/initialization/startup_replay.cpp src/initialization/staged_initialization.cpp)
 target_sources(laser_mapping PRIVATE src/initialization/gravity_norm_constraint.cpp)
 target_sources(laser_mapping PRIVATE src/imu_support.cpp)
+target_sources(laser_mapping PRIVATE src/memory_mode/memory.cpp)
+target_sources(laser_mapping PRIVATE src/memory_mode/spatial_sliding/spatial_sliding.cpp)
 target_link_libraries(laser_mapping initialization)
 
 # Add the main executable

@@ -7,10 +7,9 @@
 #include <iomanip>
 #include <stdexcept>
 
-bool LIVMapper::prepareCameraEvent(double &timestamp,double sensor_time)
+bool LIVMapper::prepareCameraEvent(double &timestamp,double sensor_time,bool eof)
 {
   std::lock_guard<std::mutex> lock(mtx_buffer);
-  bool eof=false;ros::param::get("/fast_livo/input_finished",eof);
   vector<double> first,last;
   size_t selected=camera_queues.size();timestamp=std::numeric_limits<double>::infinity();
   for(size_t k=0;k<camera_queues.size();++k) {
@@ -54,7 +53,8 @@ bool LIVMapper::syncCameraEvent(LidarMeasureGroup &meas)
       lid_header_time_buffer[imu_checked_scans-1]+lid_raw_data_buffer[imu_checked_scans-1]->points.back().curvature*.001);
   const double coverage=std::min(camera_lidar_coverage,last_timestamp_imu);
   double timestamp;
-  if(!prepareCameraEvent(timestamp,coverage))return false;
+  bool eof=false;ros::param::get("/fast_livo/input_finished",eof);
+  if(!prepareCameraEvent(timestamp,coverage,eof))return false;
   const double begin=meas.last_lio_update_time;
   MeasureGroup m=collectLivoSlice(meas,timestamp);
   meas.measures.clear();

@@ -8,6 +8,7 @@
 #include <iostream>
 #include <iomanip>
 #include <chrono>
+#include <memory>
 
 namespace {
 template<class T>T Get(const YAML::Node& p,const char* key,T fallback) {
@@ -17,7 +18,7 @@ template<class T>T Get(const YAML::Node& p,const char* key,T fallback) {
 // Offline, independent LiDAR/IMU calibration. No LIVMapper or ESIKF is created.
 int main(int argc,char** argv) {
   try {
-    if(argc!=5)throw std::runtime_error("Usage: fastlivo_batch_initialize PROFILE BAG OUTPUT_DIR BAG_START_SECONDS");
+    if(argc<5)throw std::runtime_error("Usage: fastlivo_batch_initialize PROFILE BAG OUTPUT_DIR BAG_START_SECONDS [ADDITIONAL_BAG ...]");
     ros::init(argc,argv,"batch_imu_initialization",ros::init_options::NoSigintHandler);
     const auto config=YAML::LoadFile(argv[1]);const auto imu_config=config["imu"];
     const auto directory=std::filesystem::path(argv[3]);std::filesystem::create_directories(directory);
@@ -49,9 +50,16 @@ int main(int argc,char** argv) {
     const auto lidar_topic=config["common"]["lid_topic"].as<std::string>();
     const auto imu_topic=config["common"]["imu_topic"].as<std::string>();
     rosbag::Bag bag(argv[2],rosbag::bagmode::Read);rosbag::View all(bag);
+    std::vector<std::unique_ptr<rosbag::Bag>> additional_bags;
+    for(int i=5;i<argc;++i) {
+      additional_bags.emplace_back(new rosbag::Bag(argv[i],rosbag::bagmode::Read));
+      all.addQuery(*additional_bags.back());
+    }
     const double bag_begin=all.getBeginTime().toSec(),epoch=std::floor(bag_begin)-1.;
     const ros::Time start=ros::Time().fromSec(bag_begin+requested_start);
     rosbag::View view(bag,rosbag::TopicQuery(std::vector<std::string>{lidar_topic,imu_topic}),start);
+    for(const auto& additional:additional_bags)
+      view.addQuery(*additional,rosbag::TopicQuery(std::vector<std::string>{lidar_topic,imu_topic}),start);
     std::vector<initialization::LivoScan> scans;std::vector<double> records;
     std::vector<initialization::ImuSample::ConstPtr> imu;
     double first=-1,last_record=-1;

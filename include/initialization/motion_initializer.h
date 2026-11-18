@@ -132,14 +132,17 @@ public:
     if(!target) { target=reduced; buildGrid();buildNormals();return out; }
     V3D translation=last_translation+velocity_guess*(end-last_scan_time);
     PoseMatrix H=PoseMatrix::Zero();double rms=0;int count=0;
+    size_t plane_candidates=0;
     for(int iteration=0;iteration<20;++iteration) {
       H.setZero();PoseVector gradient=PoseVector::Zero();double squared=0;count=0;
+      plane_candidates=0;
       for(const auto &pt:*reduced) {
         const V3D body(pt.x,pt.y,pt.z);
         V3D p=R*body-velocity_guess*(double(pt.curvature)*.001)+translation;
         PointType search{};search.x=p.x();search.y=p.y();search.z=p.z();
         std::vector<int> ids(1);std::vector<float> distances(1);
         if(nearest(search,1,ids,distances)!=1 || distances[0]>.64 || normals[ids[0]].norm()<.5)continue;
+        ++plane_candidates;
         const V3D &n=normals[ids[0]];double r=n.dot(p-centers[ids[0]]);if(std::abs(r)>.3)continue;
         double weight=std::min(1.,.05/std::max(1e-9,std::abs(r)));
         // Right rotation increment, world-frame translation increment.
@@ -159,7 +162,8 @@ public:
       rms=std::sqrt(squared/count);
       if(step.head<3>().norm()<1e-5 && step.tail<3>().norm()<1e-4)break;
     }
-    out.match_ratio=double(count)/reduced->size();out.residual=rms;
+    out.match_ratio=plane_candidates ? double(count)/plane_candidates : 0.;
+    out.residual=rms;
     if(out.match_ratio<.20 || rms>.10)return out;
     // Use isotropic conservative per-scan registration noise with observed anisotropy.
     out.pose_covariance=H.ldlt().solve(PoseMatrix::Identity())*(double(count)*.03*.03);

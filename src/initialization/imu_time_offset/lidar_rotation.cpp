@@ -154,14 +154,16 @@ RotationFit RegisterPreparedRotation(const RegistrationTarget& geometry,
     const auto& centers=geometry.centers;
     M3D R = prediction.valid ? prediction.rotation : M3D::Identity();
     V3D t = prediction.valid ? prediction.translation : V3D::Zero();
+    size_t plane_candidates = 0;
     auto linearize = [&](Matrix6& H,Vector6& g,double& squared,size_t& count) {
-        H.setZero();g.setZero();squared=0;count=0;
+        H.setZero();g.setZero();squared=0;count=0;plane_candidates=0;
         std::vector<int> ids(1);std::vector<float> distances(1);
         for (const auto& point : *source.cloud) {
             const V3D rotated = R*V3D(point.x,point.y,point.z),p = rotated+t;
             PointType search{};search.x=p.x();search.y=p.y();search.z=p.z();
             if (tree.nearestKSearch(search,1,ids,distances) != 1 ||
                 distances[0] > .64 || normals[ids[0]].norm() < .5) continue;
+            ++plane_candidates;
             const V3D& n = normals[ids[0]];
             const double e = n.dot(p-centers[ids[0]]);
             if (std::abs(e) > .3) continue;
@@ -181,7 +183,8 @@ RotationFit RegisterPreparedRotation(const RegistrationTarget& geometry,
         if (step.head<3>().norm() < 1e-5 && step.tail<3>().norm() < 1e-4) break;
     }
     linearize(H,g,squared,count);
-    out.matches = count;out.ratio = double(count)/source.cloud->size();
+    out.matches = count;
+    out.ratio = plane_candidates ? double(count)/plane_candidates : 0.;
     out.rms = count ? std::sqrt(squared/count) : 0;
     if (count < 100 || out.ratio < .25 || out.rms > .10) return out;
     const M3D Htt = H.bottomRightCorner<3,3>();

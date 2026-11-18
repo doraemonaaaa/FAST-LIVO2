@@ -24,6 +24,10 @@ which is included as part of this source code package.
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
+#include <filesystem>
+#include <memory>
+#include "memory_mode/spatial_sliding/window.h"
+namespace flivo { class VoxelPager; }
 #include <visualization_msgs/Marker.h>
 #include <visualization_msgs/MarkerArray.h>
 
@@ -188,6 +192,15 @@ class VoxelMapManager
 {
 public:
   VoxelMapManager() = default;
+  ~VoxelMapManager();
+  void EnablePaging(const std::filesystem::path& path);
+  VoxelOctoTree* GetVoxel(const VOXEL_LOCATION& key);
+  void BeginCacheFrame();
+  struct CacheStats {size_t total=0,resident=0,working=0;uint64_t loads=0,evictions=0,bytes_written=0;};
+  CacheStats GetCacheStats() const;
+  size_t ApplySpatialWindow(const flivo::SpatialWindowBounds& bounds);
+  std::optional<flivo::SpatialWindowBounds> spatial_window_;
+  uint64_t sliding_rejected_points_ = 0;
   VoxelMapConfig config_setting_;
   int current_frame_id_ = 0;
   ros::Publisher voxel_map_pub_;
@@ -217,14 +230,7 @@ public:
   std::vector<pointWithVar> pv_list_;
   std::vector<PointToPlane> ptpl_list_;
 
-  VoxelMapManager(VoxelMapConfig &config_setting, std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &voxel_map)
-      : config_setting_(config_setting), voxel_map_(voxel_map)
-  {
-    current_frame_id_ = 0;
-    feats_undistort_.reset(new PointCloudXYZI());
-    feats_down_body_.reset(new PointCloudXYZI());
-    feats_down_world_.reset(new PointCloudXYZI());
-  };
+  VoxelMapManager(VoxelMapConfig &config_setting, std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &voxel_map);
 
   void StateEstimation(StatesGroup &state_propagat);
   void TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
@@ -246,6 +252,7 @@ public:
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
 
 private:
+  std::unique_ptr<flivo::VoxelPager> pager_;
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);
 
   void pubSinglePlane(visualization_msgs::MarkerArray &plane_pub, const std::string plane_ns, const VoxelPlane &single_plane, const float alpha,

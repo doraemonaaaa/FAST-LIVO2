@@ -14,6 +14,8 @@ which is included as part of this source code package.
 #define LIVO_FEATURE_H_
 
 #include "visual_point.h"
+#include <memory>
+namespace flivo { struct MappedImage; }
 
 // A salient image region that is tracked across frames.
 struct Feature
@@ -30,6 +32,7 @@ struct Feature
   double timestamp = 0;
   FeatureType type_;     //!< Type can be corner or edgelet.
   cv::Mat img_;          //!< Image associated with the patch feature
+  std::shared_ptr<const flivo::MappedImage> image_backing_; // Own external image pixels in page mode.
   Vector2d px_;          //!< Coordinates in pixels on pyramid level 0.
   Vector3d f_;           //!< Unit-bearing vector of the patch feature.
   int level_;            //!< Image pyramid level where patch feature was extracted.

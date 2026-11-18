@@ -225,7 +225,7 @@ void VisualCamera::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int leve
                                 pc.y() + (y - patch_size_half)*scale).value;
 }
 
-void VisualCamera::insertPointIntoVoxelMap(VisualPoint *pt_new)
+bool VisualCamera::insertPointIntoVoxelMap(VisualPoint *pt_new)
 {
   V3D pt_w(pt_new->pos_[0], pt_new->pos_[1], pt_new->pos_[2]);
   double voxel_size = 0.5;
@@ -236,6 +236,11 @@ void VisualCamera::insertPointIntoVoxelMap(VisualPoint *pt_new)
     if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
   }
   VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+  if (spatial_window && !spatial_window->IntersectsVoxel(position.x,position.y,position.z,voxel_size)) {
+    ++sliding_rejected_points;
+    delete pt_new;
+    return false;
+  }
   auto iter = feat_map.find(position);
   if (iter != feat_map.end())
   {
@@ -248,6 +253,7 @@ void VisualCamera::insertPointIntoVoxelMap(VisualPoint *pt_new)
     ot->voxel_points.push_back(pt_new);
     feat_map[position] = ot;
   }
+  return true;
 }
 
 void VisualCamera::getWarpMatrixAffineHomography(const vk::AbstractCamera &cam, const V2D &px_ref, const V3D &xyz_ref, const V3D &normal_ref,
@@ -574,7 +580,7 @@ void VisualCamera::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar>
           if (iter != plane_map.end())
           {
             VoxelOctoTree *current_octo;
-            current_octo = iter->second->find_correspond(sample_point_w);
+            current_octo = (plane_lookup ? plane_lookup(sample_pos) : iter->second)->find_correspond(sample_point_w);
             if (current_octo->plane_ptr_->is_plane_)
             {
               pointWithVar plane_center;
@@ -871,6 +877,7 @@ void VisualCamera::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt_new, patch, pc, f, new_frame_->T_f_w_, 0);
       ftr_new->img_ = img;
+      ftr_new->image_backing_ = current_image_backing;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->camera_index = camera_index;
       ftr_new->timestamp = image_timestamp;
@@ -889,7 +896,7 @@ void VisualCamera::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg
 
       }
 
-      if (created) insertPointIntoVoxelMap(pt_new);
+      if (created && !insertPointIntoVoxelMap(pt_new)) continue;
       add += 1;
       // map_cur_frame.push_back(pt_new);
     }
@@ -956,6 +963,7 @@ void VisualCamera::updateVisualMapPoints(cv::Mat img)
       Vector3d f = cam->cam2world(pc);
       Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
       ftr_new->img_ = img;
+      ftr_new->image_backing_ = current_image_backing;
       ftr_new->id_ = new_frame_->id_;
       ftr_new->camera_index = camera_index;
       ftr_new->timestamp = image_timestamp;
@@ -992,7 +1000,7 @@ void VisualCamera::updateReferencePatch(const unordered_map<VOXEL_LOCATION, Voxe
     if (iter != plane_map.end())
     {
       VoxelOctoTree *current_octo;
-      current_octo = iter->second->find_correspond(p_w);
+      current_octo = (plane_lookup ? plane_lookup(position) : iter->second)->find_correspond(p_w);
       if (current_octo->plane_ptr_->is_plane_)
       {
         VoxelPlane &plane = *current_octo->plane_ptr_;
@@ -1546,6 +1554,10 @@ void VisualCamera::prepareFrame(const MeasureGroup::Image &image, vector<pointWi
   if (width != img.cols || height != img.rows) throw std::runtime_error("Camera image/calibration size mismatch: " + id);
   img_rgb = img.clone(); img_cp = img.clone();
   if (img.channels() == 3) cv::cvtColor(img, img, CV_BGR2GRAY);
+  if (image_store) {
+    current_image_backing = image_store->Store(img);
+    img = current_image_backing->pixels;
+  }
   gray = img;
   new_frame_.reset(new Frame(cam, gray));
   updateFrameState(*state);
@@ -1573,5 +1585,12 @@ void VisualCamera::finishFrame(vector<pointWithVar> &pg,
   updateVisualMapPoints(gray);
   updateReferencePatch(map);
   if (colmap_output_en) dumpDataForColmap();
+  if (image_store) {
+    std::set<const flivo::MappedImage*> working{current_image_backing.get()};
+    for (const auto* point : visual_submap->voxel_points)
+      for (const auto* observation : point->observations(camera_index))
+        if (observation->image_backing_) working.insert(observation->image_backing_.get());
+    image_store->Trim(working);
+  }
   ++frame_count;
 }

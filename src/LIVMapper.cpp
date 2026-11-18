@@ -116,6 +116,7 @@ LIVMapper::LIVMapper(ros::NodeHandle &nh)
   root_dir = ROOT_DIR;
   initializeFiles();
   initializeComponents();
+  configureMemory();
   startup_replay.restore(*this);
   path.header.stamp = ros::Time::now();
   path.header.frame_id = "camera_init";
@@ -125,6 +126,15 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters(ros::NodeHandle &nh)
 {
+  nh.param<std::string>("memory_mode",memory_mode,"full");
+  if(memory_mode!="full" && memory_mode!="page" && memory_mode!="spatial_sliding")
+    throw std::runtime_error("memory_mode must be full, page or spatial_sliding");
+  nh.param<double>("sliding_half_extent_m",sliding_half_extent_m,50.);
+  nh.param<double>("sliding_trigger_m",sliding_trigger_m,5.);
+  flivo::SpatialSlidingWindow(sliding_half_extent_m,sliding_trigger_m); // Validate units/range.
+  bool legacy_sliding=false;nh.param<bool>("local_map/map_sliding_en",legacy_sliding,false);
+  if(memory_mode=="spatial_sliding" && legacy_sliding)
+    throw std::runtime_error("spatial_sliding replaces local_map/map_sliding_en; enable only one spatial window");
   nh.param<bool>("imu/gravity_norm_constraint",gravity_norm_constraint,true);
   nh.param<double>("imu/gravity_norm_sigma",gravity_norm_sigma,.02);
   if(!std::isfinite(gravity_norm_sigma) || gravity_norm_sigma<=0)
@@ -426,6 +436,8 @@ void LIVMapper::stateEstimationAndMapping()
       break;
   }
   startup_replay.afterUpdate(*this);
+  finishMemoryFrame();
+  recordMemory();
 }
 
 void LIVMapper::handleVIO() 
@@ -497,6 +509,7 @@ void LIVMapper::handleVIO()
 
 void LIVMapper::handleLIO() 
 {    
+  voxelmap_manager->BeginCacheFrame();
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
            << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
@@ -729,6 +742,7 @@ void LIVMapper::run()
     flivo_trace::state("post_est", trace_frame, _state);
   }
   savePCD();
+  recordMemory(true);
 }
 
 void LIVMapper::prop_imu_once(StatesGroup &imu_prop_state, const double dt, V3D acc_avr, V3D angvel_avr)

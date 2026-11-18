@@ -15,6 +15,7 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 #include "feature.h"
+#include "memory_mode/page/image_backing.h"
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
@@ -139,6 +140,11 @@ public:
 
   ofstream fout_camera, fout_colmap;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> &feat_map;
+  std::unique_ptr<flivo::ImageBackingStore> image_store;
+  std::shared_ptr<const flivo::MappedImage> current_image_backing;
+  std::function<VoxelOctoTree*(const VOXEL_LOCATION&)> plane_lookup;
+  std::optional<flivo::SpatialWindowBounds> spatial_window;
+  uint64_t sliding_rejected_points = 0;
   unordered_map<VOXEL_LOCATION, int> sub_feat_map; 
   unordered_map<int, Warp *> warp_map;
   vector<VisualPoint *> retrieve_voxel_points;
@@ -179,7 +185,7 @@ public:
                                      const V3D &xyz_ref, const V3D &normal_ref, const SE3 &T_cur_ref, const int level_ref, Matrix2d &A_cur_ref);
   void warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref, const Vector2d &px_ref, const int level_ref, const int search_level,
                   const int pyramid_level, const int halfpatch_size, float *patch);
-  void insertPointIntoVoxelMap(VisualPoint *pt_new);
+  bool insertPointIntoVoxelMap(VisualPoint *pt_new);
   void plotTrackedPoints();
   void updateFrameState(StatesGroup state);
   void projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
@@ -207,6 +213,7 @@ class VIOManager
 public:
   vector<std::unique_ptr<VisualCamera>> cameras;
   unordered_map<VOXEL_LOCATION, VOXEL_POINTS *> visual_map;
+  size_t ApplySpatialWindow(const flivo::SpatialWindowBounds& bounds);
   StatesGroup *state = nullptr, *state_propagat = nullptr;
   size_t anchor_index = 0;
   double sync_tolerance = 0.0001;

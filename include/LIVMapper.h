@@ -38,6 +38,15 @@ public:
   ofstream camera_frames_log;
   void initializeFiles();
   void recordInitializationDiagnostics();
+  void configureMemory();
+  void recordMemory(bool force=false);
+  void finishMemoryFrame();
+  std::string memory_mode = "full";
+  double sliding_half_extent_m = 50., sliding_trigger_m = 5.;
+  std::unique_ptr<flivo::SpatialSlidingWindow> spatial_window;
+  uint64_t window_moves=0, sliding_lio_evictions=0, sliding_vio_evictions=0;
+  std::ofstream memory_log;
+  double memory_last_recorded = -1;
   InitializationDiagnostics initialization_diagnostics;
   void run();
   void gravityAlignment();
@@ -166,7 +175,7 @@ public:
   double last_camera_event_time = -1;
   uint64_t last_camera_event_stamp = 0;
   double camera_lidar_coverage = -1;
-  bool prepareCameraEvent(double &timestamp,double sensor_time);
+  bool prepareCameraEvent(double &timestamp,double sensor_time,bool eof);
   bool syncCameraEvent(LidarMeasureGroup &meas);
   void saveCameraEvent();
   ofstream camera_event_frames_log, camera_input_log;

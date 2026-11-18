@@ -20,7 +20,9 @@ bool LIVMapper::syncScanEvent(LidarMeasureGroup &meas)
   }
   const double coverage=std::min(camera_lidar_coverage,last_timestamp_imu);
   double image_time;
-  const bool image_ready=prepareCameraEvent(image_time,coverage);
+  // Both sensor decisions must use the same EOF snapshot: a transition while
+  // preparing an image must not release it ahead of an earlier waiting scan.
+  const bool image_ready=prepareCameraEvent(image_time,coverage,eof);
   bool scan_ready=end<=coverage;
   if(scan_ready) {
     std::lock_guard<std::mutex> lock(mtx_buffer);
@@ -33,6 +35,8 @@ bool LIVMapper::syncScanEvent(LidarMeasureGroup &meas)
     if(std::isfinite(image_time) && image_time<end && !image_ready)scan_ready=false;
   }
   if(!image_ready && !scan_ready)return false;
+  // A blocked earlier scan also blocks later visual state propagation.
+  if(image_ready && end<=image_time && !scan_ready)return false;
   MeasureGroup m;
   bundle_sequential_updates=false;
   meas.pcl_proc_cur->clear();

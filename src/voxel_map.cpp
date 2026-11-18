@@ -12,6 +12,37 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 #include "state_numerics.h"
+#include "memory_mode/page/voxel_pager.h"
+
+VoxelMapManager::VoxelMapManager(VoxelMapConfig &config,
+    std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map)
+    : config_setting_(config), voxel_map_(map) {
+  feats_undistort_.reset(new PointCloudXYZI());
+  feats_down_body_.reset(new PointCloudXYZI());
+  feats_down_world_.reset(new PointCloudXYZI());
+}
+VoxelMapManager::~VoxelMapManager() {
+  pager_.reset();
+  for (auto &item : voxel_map_) delete item.second;
+}
+void VoxelMapManager::EnablePaging(const std::filesystem::path& path) {
+  if (!pager_) pager_=std::make_unique<flivo::VoxelPager>(voxel_map_,path);
+}
+VoxelOctoTree* VoxelMapManager::GetVoxel(const VOXEL_LOCATION& key) {
+  if (pager_) return pager_->Ensure(key);
+  const auto it=voxel_map_.find(key);
+  return it==voxel_map_.end() ? nullptr : it->second;
+}
+void VoxelMapManager::BeginCacheFrame() {if(pager_)pager_->BeginFrame();}
+VoxelMapManager::CacheStats VoxelMapManager::GetCacheStats() const {
+  CacheStats out;out.total=out.resident=voxel_map_.size();
+  if(pager_) {
+    const auto& p=pager_->stats;
+    out.resident-=p.cold;out.working=p.working;out.loads=p.loads;
+    out.evictions=p.evictions;out.bytes_written=p.bytes_written;
+  }
+  return out;
+}
 
 namespace
 {
@@ -577,6 +608,10 @@ void VoxelMapManager::BuildVoxelMap()
   {
     const pointWithVar p_v = input_points[i];
     const VOXEL_LOCATION position = voxelLocation(p_v.point_w, voxel_size);
+    if (spatial_window_ && !spatial_window_->IntersectsVoxel(position.x,position.y,position.z,voxel_size)) {
+      ++sliding_rejected_points_;continue;
+    }
+    if (pager_) pager_->Ensure(position,true);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
@@ -598,6 +633,7 @@ void VoxelMapManager::BuildVoxelMap()
   }
   for (auto iter = voxel_map_.begin(); iter != voxel_map_.end(); ++iter)
   {
+    if (pager_) pager_->Ensure(iter->first,true);
     iter->second->init_octo_tree();
   }
 }
@@ -630,6 +666,14 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   {
     const pointWithVar p_v = input_points[i];
     const VOXEL_LOCATION position = voxelLocation(p_v.point_w, voxel_size);
+    if (spatial_window_ && !spatial_window_->IntersectsVoxel(position.x,position.y,position.z,voxel_size)) {
+      ++sliding_rejected_points_;continue;
+    }
+    if (pager_) {
+      const auto* tree=pager_->Ensure(position);
+      if(tree && (!tree->init_octo_ || !tree->plane_ptr_->is_plane_ || tree->update_enable_))
+        pager_->Ensure(position,true);
+    }
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
     else
@@ -642,6 +686,7 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
       voxel_map_[position]->voxel_center_[1] = (0.5 + position.y) * voxel_size;
       voxel_map_[position]->voxel_center_[2] = (0.5 + position.z) * voxel_size;
       voxel_map_[position]->UpdateOctoTree(p_v);
+      if (pager_) pager_->Ensure(position,true);
     }
   }
 }
@@ -651,6 +696,9 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   int max_layer = config_setting_.max_layer_;
   double voxel_size = config_setting_.max_voxel_size_;
   double sigma_num = config_setting_.sigma_num_;
+  // Restore the complete query neighborhood before entering OpenMP. No file
+  // access or hash-table mutations occur in the parallel residual loop.
+  if (pager_) pager_->Prepare(pv_list,voxel_size);
   std::mutex mylock;
   ptpl_list.clear();
   std::vector<PointToPlane> all_ptpl_list(pv_list.size());
@@ -803,6 +851,7 @@ void VoxelMapManager::pubVoxelMap()
   std::vector<VoxelPlane> pub_plane_list;
   for (auto iter = voxel_map_.begin(); iter != voxel_map_.end(); iter++)
   {
+    if (pager_) pager_->Ensure(iter->first);
     GetUpdatePlane(iter->second, config_setting_.max_layer_, pub_plane_list);
   }
   for (size_t i = 0; i < pub_plane_list.size(); i++)
@@ -958,6 +1007,7 @@ void VoxelMapManager::clearMemOutOfMap(const int& x_max,const int& x_min,const i
     const VOXEL_LOCATION& loc = it->first;
     bool should_remove = loc.x > x_max || loc.x < x_min || loc.y > y_max || loc.y < y_min || loc.z > z_max || loc.z < z_min;
     if (should_remove){
+      if (pager_) pager_->Forget(loc);
       // last_delete_time = omp_get_wtime();
       delete it->second;
       it = voxel_map_.erase(it);
