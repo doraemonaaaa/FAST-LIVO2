@@ -10,7 +10,7 @@
 #include <deque>
 
 // Short-window, attitude-aided LiDAR pose bootstrap. No map/EKF feedback.
-// Points and inertial increments are expressed in the first scan's IMU frame.
+// Register endpoint clouds to consecutive scans; fit motion in the window anchor frame.
 class MotionInitializer {
 public:
   void setBias(const V3D &bg,const V3D &ba,double scale) {bias_seeded_=true;bg_=bg;ba_=ba;scale_=scale;}
@@ -49,7 +49,7 @@ public:
                 const std::deque<sensor_msgs::Imu::ConstPtr> &imus,
                 const M3D &R_LI, const V3D &t_LI) {
     Result out;
-    if(imus.empty() || scan.empty()) return out;
+    if(imus.empty() || scan.empty()) { resetWindow(); return out; }
     if(imus.back()->header.stamp.toNSec()<ros::Time().fromSec(end).toNSec())
       throw std::runtime_error("motion initialization would extrapolate beyond acquired IMU");
     const auto &m=imus.back(); Eigen::Quaterniond q(m->orientation.w,m->orientation.x,m->orientation.y,m->orientation.z);
@@ -99,7 +99,9 @@ public:
     }
     // End-of-scan attitude, rotational deskew, and the latest independent velocity estimate.
     const M3D imu_rotation=bias_seeded_?gyro_rotation_:(anchor.conjugate()*q).toRotationMatrix();
-    M3D R=last_rotation*last_imu_rotation.transpose()*imu_rotation;
+    M3D relative_rotation=last_imu_rotation.transpose()*imu_rotation;
+    const M3D endpoint_prior=last_rotation*relative_rotation;
+    const V3D endpoint_velocity=endpoint_prior.transpose()*velocity_guess;
     V3D omega=V3D(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z)-bg_;
     PointCloudXYZI::Ptr cloud(new PointCloudXYZI());
     for(const auto &pt:scan) {
@@ -107,30 +109,31 @@ public:
       double dt=end-(begin+double(pt.curvature)*.001);
       if(dt<-.01 || dt>.3) continue;
       V3D w=-omega*dt; double angle=w.norm();M3D dR=M3D::Identity();if(angle>1e-10)dR=Eigen::AngleAxisd(angle,w/angle).toRotationMatrix();
-      p=dR*(R_LI*p+t_LI);
+      p=dR*(R_LI*p+t_LI)-endpoint_velocity*dt;
       PointType v=pt;v.x=p.x();v.y=p.y();v.z=p.z();v.curvature=dt*1000.;cloud->push_back(v);
     }
     // Deterministic voxel centroids; avoid binary PCL/Eigen alignment dependencies.
-    struct Cell { V3D sum=V3D::Zero(); double time=0; int count=0; };
+    struct Cell { V3D sum=V3D::Zero(); int count=0; };
     std::map<std::array<int,3>,Cell> cells;
     for(const auto &p:*cloud) {
-      const V3D body(p.x,p.y,p.z), predicted=R*body-velocity_guess*(double(p.curvature)*.001);
-      std::array<int,3> key{{int(std::floor(predicted.x()/.25)),int(std::floor(predicted.y()/.25)),int(std::floor(predicted.z()/.25))}};
-      auto &cell=cells[key];cell.sum+=body;cell.time+=p.curvature;++cell.count;
+      const V3D body(p.x,p.y,p.z);
+      std::array<int,3> key{{int(std::floor(body.x()/.25)),int(std::floor(body.y()/.25)),int(std::floor(body.z()/.25))}};
+      auto &cell=cells[key];cell.sum+=body;++cell.count;
     }
     PointCloudXYZI::Ptr reduced(new PointCloudXYZI());
     for(const auto &entry:cells) {
       const auto &cell=entry.second;V3D p=cell.sum/cell.count;
-      PointType v{};v.x=p.x();v.y=p.y();v.z=p.z();v.curvature=cell.time/cell.count;reduced->push_back(v);
+      PointType v{};v.x=p.x();v.y=p.y();v.z=p.z();reduced->push_back(v);
     }
-    if(reduced->size()<100) {
-      // Establish the anchor at the first usable reference scan. Otherwise a
-      // later body-frame target would be mistaken for the earlier anchor frame.
-      if(!target)resetWindow();
+    // A rejected pair breaks the measured displacement chain. Keep first_attempt
+    // so restarting the local window never extends the overall timeout.
+    auto reject_pair = [&]() { resetWindow(); return out; };
+    if(reduced->size()<100) return reject_pair();
+    if(!target) {
+      if(!setTarget(reduced)) return reject_pair();
       return out;
     }
-    if(!target) { target=reduced; buildGrid();buildNormals();return out; }
-    V3D translation=last_translation+velocity_guess*(end-last_scan_time);
+    V3D relative_translation=last_rotation.transpose()*velocity_guess*(end-last_scan_time);
     PoseMatrix H=PoseMatrix::Zero();double rms=0;int count=0;
     size_t plane_candidates=0;
     for(int iteration=0;iteration<20;++iteration) {
@@ -138,37 +141,52 @@ public:
       plane_candidates=0;
       for(const auto &pt:*reduced) {
         const V3D body(pt.x,pt.y,pt.z);
-        V3D p=R*body-velocity_guess*(double(pt.curvature)*.001)+translation;
+        const V3D p=relative_rotation*body+relative_translation;
         PointType search{};search.x=p.x();search.y=p.y();search.z=p.z();
         std::vector<int> ids(1);std::vector<float> distances(1);
         if(nearest(search,1,ids,distances)!=1 || distances[0]>.64 || normals[ids[0]].norm()<.5)continue;
         ++plane_candidates;
         const V3D &n=normals[ids[0]];double r=n.dot(p-centers[ids[0]]);if(std::abs(r)>.3)continue;
         double weight=std::min(1.,.05/std::max(1e-9,std::abs(r)));
-        // Right rotation increment, world-frame translation increment.
-        PoseVector J;J.head<3>()=body.cross(R.transpose()*n);J.tail<3>()=n;
+        // Right rotation increment; translation is in the previous scan frame.
+        PoseVector J;J.head<3>()=body.cross(relative_rotation.transpose()*n);J.tail<3>()=n;
         H+=weight*J*J.transpose();gradient+=weight*J*r;squared+=r*r;++count;
       }
-      if(count<100)return out;
-      if((H.diagonal().array()<=1e-9).any())return out;
+      if(count<100)return reject_pair();
+      if((H.diagonal().array()<=1e-9).any())return reject_pair();
       // Normalize rotation/translation units before checking six-DoF rank.
       const PoseMatrix scale=H.diagonal().cwiseSqrt().cwiseInverse().asDiagonal();
       Eigen::SelfAdjointEigenSolver<PoseMatrix> es(scale*H*scale);
       out.eigen_ratio=es.eigenvalues().minCoeff()/es.eigenvalues().maxCoeff();
-      if(out.eigen_ratio<.005)return out;
+      if(out.eigen_ratio<.005)return reject_pair();
       PoseVector step=-H.ldlt().solve(gradient);
-      if(!step.allFinite() || step.head<3>().norm()>.2 || step.tail<3>().norm()>.75)return out;
-      R=R*Exp(V3D(step.head<3>()));translation+=step.tail<3>();
+      if(!step.allFinite() || step.head<3>().norm()>.2 || step.tail<3>().norm()>.75)return reject_pair();
+      relative_rotation=relative_rotation*Exp(V3D(step.head<3>()));
+      relative_translation+=step.tail<3>();
       rms=std::sqrt(squared/count);
       if(step.head<3>().norm()<1e-5 && step.tail<3>().norm()<1e-4)break;
     }
     out.match_ratio=plane_candidates ? double(count)/plane_candidates : 0.;
     out.residual=rms;
-    if(out.match_ratio<.20 || rms>.10)return out;
-    // Use isotropic conservative per-scan registration noise with observed anisotropy.
-    out.pose_covariance=H.ldlt().solve(PoseMatrix::Identity())*(double(count)*.03*.03);
-    // Marginal translation covariance includes uncertainty coupled to rotation.
-    const M3D info=out.pose_covariance.bottomRightCorner<3,3>().inverse();
+    if(out.match_ratio<.20 || rms>.10)return reject_pair();
+    if(!setTarget(reduced)) return reject_pair();
+
+    const V3D translation=last_translation+last_rotation*relative_translation;
+    const M3D R=(Eigen::Quaterniond(last_rotation)*Eigen::Quaterniond(relative_rotation))
+                    .normalized().toRotationMatrix();
+    const PoseMatrix pair_covariance=H.ldlt().solve(PoseMatrix::Identity())*(double(count)*.03*.03);
+    // Weight each observation by its pairwise registration quality in the anchor axes.
+    const M3D info=last_rotation*pair_covariance.bottomRightCorner<3,3>().inverse()*last_rotation.transpose();
+    // ESIKF consumes endpoint pose uncertainty, including preceding increments.
+    // Compose right attitude errors and additive anchor-frame position errors.
+    M3D skew; skew << SKEW_SYM_MATRX(relative_translation);
+    PoseMatrix previous_jacobian=PoseMatrix::Identity(), pair_jacobian=PoseMatrix::Identity();
+    previous_jacobian.topLeftCorner<3,3>()=relative_rotation.transpose();
+    previous_jacobian.bottomLeftCorner<3,3>()=-last_rotation*skew;
+    pair_jacobian.bottomRightCorner<3,3>()=last_rotation;
+    out.pose_covariance=previous_jacobian*last_pose_covariance*previous_jacobian.transpose()
+                        +pair_jacobian*pair_covariance*pair_jacobian.transpose();
+    last_pose_covariance=out.pose_covariance;
     integrateAcceptedMotion(R,imu_rotation,gravity,end);
     observations.push_back({out.elapsed,translation,dp,dv,info});
     last_translation=translation;last_scan_time=end;last_rotation=R;last_imu_rotation=imu_rotation;
@@ -202,6 +220,7 @@ public:
     return out;
   }
 private:
+  PoseMatrix last_pose_covariance=PoseMatrix::Zero();
   bool bias_seeded_=false;
   V3D bg_=V3D::Zero(),ba_=V3D::Zero(),previous_omega_=V3D::Zero();
   double scale_=1.;
@@ -231,8 +250,13 @@ private:
   bool estimate_gravity_;
   int gravity_stable_windows_=0;
   V3D last_fit_gravity_=V3D::Zero();
-  void buildNormals() {
-    normals.resize(target->size(),V3D::Zero());centers.resize(target->size(),V3D::Zero());
+  bool setTarget(const PointCloudXYZI::Ptr &cloud) {
+    target=cloud;
+    grid.clear();
+    buildGrid();
+    normals.assign(target->size(),V3D::Zero());
+    centers.resize(target->size());
+    size_t usable=0;
     for(size_t i=0;i<target->size();++i) {
       std::vector<int> ids(12);std::vector<float> dist(12);
       if(nearest((*target)[i],12,ids,dist)!=12 || dist.back()>2.25)continue;
@@ -240,13 +264,15 @@ private:
       M3D cov=M3D::Zero();for(int id:ids){V3D d=(*target)[id].getVector3fMap().cast<double>()-mean;cov+=d*d.transpose();}
       Eigen::SelfAdjointEigenSolver<M3D> es(cov/12.);
       if(es.eigenvalues()[1]<.005 || es.eigenvalues()[0]>.01 || es.eigenvalues()[0]>.15*es.eigenvalues()[1])continue;
-      normals[i]=es.eigenvectors().col(0);centers[i]=mean;
+      normals[i]=es.eigenvectors().col(0);centers[i]=mean;++usable;
     }
+    return usable>=100;
   }
   void resetWindow() {
     start=previous_time=last_scan_time=-1;target.reset();grid.clear();normals.clear();centers.clear();observations.clear();
     previous_acc.setZero();dp.setZero();dv.setZero();velocity_guess.setZero();last_translation.setZero();
     pending_imus.clear();last_rotation.setIdentity();last_imu_rotation.setIdentity();
+    last_pose_covariance.setZero();
     gravity_stable_windows_=0;last_fit_gravity_.setZero();
   }
   double first_attempt=-1,start=-1,previous_time=-1,last_scan_time=-1;

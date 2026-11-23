@@ -41,6 +41,13 @@ LiDAR-only, frozen once and excludes query scans. Clock scoring reports activity
 through the existing replay audit so the offline runner does not abort it as
 an idle EOF window.
 
+During the stage-two velocity/gravity fit, each endpoint cloud is registered
+to the preceding accepted cloud. The relative rotations and translations are
+composed in the first endpoint's IMU frame, where the fit compares LiDAR
+displacement with IMU integration. A rejected pair starts a new observation
+window. The ten-second deadline still runs from the first attempt. A clock
+refit uses the same registration path.
+
 The external runner `our_method/run_fast_livo2_export.bash` launches fresh
 processes. `our_method/pipeline/staged_initialization.py` transfers means and
 clock decisions; `initialization_pass.py` binds input/config/runtime identities.
