@@ -70,7 +70,7 @@ class VoxelPager {
     template<class M> void ReadMatrix(M& value) {file_.read(reinterpret_cast<char*>(value.data()),value.size()*sizeof(typename M::Scalar));}
     void Point(pointWithVar& p,bool read) {
         auto matrix=[&](auto& v){if(read)ReadMatrix(v);else WriteMatrix(v);};
-        matrix(p.point_b);matrix(p.point_i);matrix(p.point_w);matrix(p.var_nostate);matrix(p.body_var);matrix(p.var);matrix(p.point_crossmat);matrix(p.normal);
+        matrix(p.point_b);matrix(p.point_w);matrix(p.body_var);matrix(p.var);matrix(p.normal);
     }
     void Plane(VoxelPlane& p,bool read) {
         auto matrix=[&](auto& v){if(read)ReadMatrix(v);else WriteMatrix(v);};

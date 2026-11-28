@@ -114,14 +114,15 @@ void ImuProcess::rewindForStartupReplay(StatesGroup &state, double end, double b
 
 void ImuProcess::deskewWholeScan(const PointCloudXYZI &raw,double begin,double end,
     const StatesGroup &reference,const deque<sensor_msgs::Imu::ConstPtr> &samples,
-    PointCloudXYZI::Ptr output)
+    const M3D &lidar_to_imu_rotation,const V3D &lidar_to_imu_translation,
+    PointCloudXYZI::Ptr output) const
 {
   if(raw.empty() || end<begin)throw std::runtime_error("Invalid physical scan interval");
   const auto integration=imu_support::Clip(samples,begin,end,imu_support::kMaximumGap);
   // A temporary inertial integration workspace, never a second estimator.
   // Freeze bias/gravity/reference velocity once, rewind and integrate the entire
   // physical scan with no intervening LIO/VIO measurement corrections.
-  ImuProcess motion;motion.set_extrinsic(Lid_offset_to_IMU,Lid_rot_to_IMU);
+  ImuProcess motion;motion.set_extrinsic(lidar_to_imu_translation,lidar_to_imu_rotation);
   motion.ba_bg_est_en=ba_bg_est_en;motion.gravity_est_en=gravity_est_en;
   motion.exposure_estimate_en=exposure_estimate_en;
   std::stringstream checkpoint;writeInitialization(checkpoint);motion.readInitialization(checkpoint);
@@ -131,5 +132,5 @@ void ImuProcess::deskewWholeScan(const PointCloudXYZI &raw,double begin,double e
   *scan.pcl_proc_cur=raw;
   MeasureGroup m;m.lio_time=end;
   for(const auto &sample:integration)if(sample->header.stamp.toSec()>begin)m.imu.push_back(sample);
-  scan.measures.push_back(m);motion.Process2(scan,trajectory,output);
+  scan.measure = m;motion.Process2(scan,trajectory,output);
 }

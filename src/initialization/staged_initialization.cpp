@@ -24,14 +24,14 @@ void StagedInitialization::observeScan(const PointCloudXYZI& points,double begin
 }
 void StagedInitialization::observe(const LidarMeasureGroup& group) {
   if(!enabled_ || phase_!="window")return;
-  for(const auto& sample:group.measures.back().imu) {
+  for(const auto& sample:group.measure.imu) {
     auto imu=initialization::CalibrationImu(*sample);
     if(imus_.empty() || imu->timestamp>imus_.back()->timestamp)imus_.push_back(imu);
   }
 }
 bool StagedInitialization::advance(LIVMapper& mapper) {
   if(!enabled_ || phase_=="refine")return true;
-  const auto& group=mapper.LidarMeasures;const auto& measure=group.measures.back();
+  const auto& group=mapper.LidarMeasures;const auto& measure=group.measure;
   const double time=group.lio_vio_flg==LIO?measure.lio_time:measure.vio_time;
   if(time<=last_)return false;
   if(ready_<0) {if(group.lio_vio_flg!=LIO)return false;ready_=time;}

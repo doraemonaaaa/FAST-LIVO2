@@ -2,6 +2,7 @@
 #include "vio.h"
 #include "state_numerics.h"
 #include "camera_events.h"
+#include "flivo_trace.h"
 #include <unordered_set>
 #include <stdexcept>
 #include <iomanip>
@@ -21,7 +22,8 @@ void VIOManager::clearStartupMap()
 
 void VIOManager::processFrame(const vector<MeasureGroup::Image> &images,
     vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map,
-    double reference_time,const std::function<void(double)> &advance)
+    double reference_time,const std::function<void(double)> &advance,
+    const vector<flivo::CameraImuMotion> &motion)
 {
   std::unordered_set<VisualPoint *> claimed;
   static const bool skip_visual = [] {
@@ -33,7 +35,16 @@ void VIOManager::processFrame(const vector<MeasureGroup::Image> &images,
     for(const auto &image:views) {
       auto &camera=*cameras.at(image.camera_index);
       if(camera.active)throw std::runtime_error("Duplicate camera in image bundle");
-      camera.active=true;camera.state_timestamp=timestamp;camera.prepareFrame(image,pg,map);
+      camera.active = true;
+      const bool timed = !motion.empty() && motion.at(image.camera_index).active();
+      camera.state_timestamp = timed ? image.timestamp : timestamp;
+      if (timed)
+      {
+        camera.observation_state = motion[image.camera_index].evaluate(*state);
+        camera.state = &camera.observation_state;
+      }
+      camera.prepareFrame(image, pg, map);
+      camera.state = state;
     }
     // Shared depth/normal uncertainty contributes through one view per bundle.
     // Keep this set across all sequential events, not just one camera call.
@@ -41,16 +52,20 @@ void VIOManager::processFrame(const vector<MeasureGroup::Image> &images,
       if(camera->active)
         for(int i=0;i<camera->total_points;++i)
           if(!claimed.insert(camera->visual_submap->voxel_points[i]).second)camera->noise_weights[i]=0;
-    if(!skip_visual)computeJacobianAndUpdateEKF();
+    if (!skip_visual) computeJacobianAndUpdateEKF(motion);
     for (const auto &camera : cameras)
       if (camera->active)
       {
-        camera->observation_state=*state;
+        camera->observation_state = motion.empty() ? *state :
+            motion[camera->camera_index].evaluate(*state);
         size_t used = 0;
         for (double w : camera->noise_weights) if (w != 0) ++used;
         if(audit)audit << std::setprecision(17) << camera->image_timestamp << ',' << camera->id << ','
               << camera->total_points << ',' << used << ',' << state->exposure(camera->camera_index)
-              << ',' << state->cov.trace() << '\n';
+              << ',' << state->cov.trace() << ',' << timestamp << ',' << camera->state_timestamp << ','
+              << (camera->observation_state.pos_end - state->pos_end).norm() << ','
+              << Eigen::AngleAxisd(state->rot_end.transpose() * camera->observation_state.rot_end).angle()
+              << '\n';
       }
   };
   if(advance) {
@@ -68,17 +83,20 @@ void VIOManager::processFrame(const vector<MeasureGroup::Image> &images,
     for(auto &camera:cameras)if(camera->active) {
       StatesGroup *shared=camera->state;
       camera->state=&camera->observation_state;
-      camera->finishFrame(pg,map);
+      camera->finishFrame(pg,map,camera->camera_index == anchor_index);
       camera->state=shared;
     }
 }
 
-void VIOManager::computeJacobianAndUpdateEKF()
+void VIOManager::computeJacobianAndUpdateEKF(const vector<flivo::CameraImuMotion> &motion)
 {
   const int dimension = state->dimension();
-  const int columns = 6 + cameras.size();
+  const int motion_start = 6 + cameras.size();
+  const int columns = motion_start + (motion.empty() ? 0 : DIM_STATE - 7);
   vector<int> indices = {0, 1, 2, 3, 4, 5};
   for (size_t k = 0; k < cameras.size(); ++k) indices.push_back(StatesGroup::exposureIndex(k));
+  if (!motion.empty())
+    for (int index = 7; index < DIM_STATE; ++index) indices.push_back(index);
   int rows = 0, levels = 0, iterations = 0;
   for (auto &camera : cameras)
     if (camera->active)
@@ -92,8 +110,8 @@ void VIOManager::computeJacobianAndUpdateEKF()
   const double covariance_scale = anchor().img_point_cov;
   for (int level = levels - 1; level >= 0; --level)
   {
-    G.setZero();
-    StatesGroup old_state = *state;
+    StatesGroup accepted_state = *state;
+    MatrixXd accepted_gain = G;
     float last_error = std::numeric_limits<float>::max();
     for (auto &camera : cameras) camera->has_ref_patch_cache = false;
     for (int iteration = 0; iteration < iterations; ++iteration)
@@ -112,12 +130,28 @@ void VIOManager::computeJacobianAndUpdateEKF()
         VectorXd local_z = VectorXd::Zero(n);
         vector<float> errors(camera->total_points, 0);
         vector<int> counts(camera->total_points, 0);
+        flivo::CameraPoseJacobian pose_jacobian;
+        const bool timed = !motion.empty() && motion[camera->camera_index].active();
+        if (timed)
+        {
+          camera->observation_state = motion[camera->camera_index].evaluate(*state, &pose_jacobian);
+          camera->state = &camera->observation_state;
+        }
         if (camera->inverse_composition_en)
           camera->buildInverseResiduals(camera->gray, level, local_H, local_z, errors, counts);
         else
           camera->buildResiduals(camera->gray, level, camera->noise_weights, local_H, local_z, errors, counts);
         const double weight = std::sqrt(covariance_scale / camera->img_point_cov);
-        H.block(offset, 0, n, 6) = local_H.leftCols(6) * weight;
+        camera->state = state;
+        if (timed)
+        {
+          // Map derivatives from the exposure-time tangent to the shared state.
+          H.block(offset, 0, n, 6).noalias() = weight * local_H.leftCols(6) * pose_jacobian.leftCols(6);
+          H.block(offset, motion_start, n, DIM_STATE - 7).noalias() =
+              weight * local_H.leftCols(6) * pose_jacobian.rightCols(DIM_STATE - 7);
+        }
+        else
+          H.block(offset, 0, n, 6) = local_H.leftCols(6) * weight;
         if (local_columns == 7)
           H.block(offset, 6 + camera->camera_index, n, 1) = local_H.col(6) * weight;
         z.segment(offset, n) = local_z * weight;
@@ -129,10 +163,20 @@ void VIOManager::computeJacobianAndUpdateEKF()
         }
         offset += n;
       }
-      if (!count) { *state = old_state; break; }
+      if (!count || !std::isfinite(error) || error / count > last_error)
+      {
+        if (flivo_trace::on())
+          flivo_trace::raw(count ? "vio_rollback_residual" : "vio_rollback_empty",
+                           level, iteration, G.norm(), accepted_gain.norm(), 0);
+        *state = accepted_state;
+        G.swap(accepted_gain);
+        break;
+      }
       error /= count;
-      if (error > last_error) { *state = old_state; break; }
-      old_state = *state;
+      // The current state and gain describe the same accepted step.
+      // Keep them together if the next candidate fails residual validation.
+      accepted_state = *state;
+      accepted_gain = G;
       last_error = error;
       const MatrixXd information = H.transpose() * H;
       const VectorXd gradient = H.transpose() * z;
@@ -171,5 +215,6 @@ void VIOManager::computeJacobianAndUpdateEKF()
   if (extra) posterior.topLeftCorner<DIM_STATE,DIM_STATE>() -= G.topRightCorner(DIM_STATE,extra)*state->cov.bottomLeftCorner(extra,DIM_STATE);
   state->cov = posterior;
   for (auto &camera : cameras)
-    if (camera->active) camera->updateFrameState(*state);
+    if (camera->active)
+      camera->updateFrameState(motion.empty() ? *state : motion[camera->camera_index].evaluate(*state));
 }

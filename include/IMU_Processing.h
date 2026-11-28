@@ -15,7 +15,6 @@ which is included as part of this source code package.
 
 #include <Eigen/Eigen>
 #include "common_lib.h"
-#include <condition_variable>
 #include <nav_msgs/Odometry.h>
 #include <utils/so3_math.h>
 #include <fstream>
@@ -58,7 +57,8 @@ public:
   void readInitialization(std::istream &in);
   void deskewWholeScan(const PointCloudXYZI &raw, double begin, double end,
       const StatesGroup &reference, const deque<sensor_msgs::Imu::ConstPtr> &samples,
-      PointCloudXYZI::Ptr output);
+      const M3D &lidar_to_imu_rotation, const V3D &lidar_to_imu_translation,
+      PointCloudXYZI::Ptr output) const;
 
   ofstream fout_imu;
   double IMU_mean_acc_norm;

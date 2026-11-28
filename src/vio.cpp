@@ -163,7 +163,6 @@ void VisualCamera::initializeVIO()
     fout_camera.close();
   }
   grid_num.resize(length);
-  map_index.resize(length);
   map_dist.resize(length);
   update_flag.resize(length);
   scan_value.resize(length);
@@ -186,7 +185,6 @@ void VisualCamera::initializeVIO()
 void VisualCamera::resetGrid()
 {
   fill(grid_num.begin(), grid_num.end(), TYPE_UNKNOWN);
-  fill(map_index.begin(), map_index.end(), 0);
   fill(map_dist.begin(), map_dist.end(), 10000.0f);
   fill(update_flag.begin(), update_flag.end(), 0);
   fill(scan_value.begin(), scan_value.end(), 0.0f);
@@ -335,25 +333,6 @@ int VisualCamera::getBestSearchLevel(const Matrix2d &A_cur_ref, const int max_le
     D *= 0.25;
   }
   return search_level;
-}
-
-double VisualCamera::calculateNCC(float *ref_patch, float *cur_patch, int patch_size)
-{
-  double sum_ref = std::accumulate(ref_patch, ref_patch + patch_size, 0.0);
-  double mean_ref = sum_ref / patch_size;
-
-  double sum_cur = std::accumulate(cur_patch, cur_patch + patch_size, 0.0);
-  double mean_curr = sum_cur / patch_size;
-
-  double numerator = 0, demoniator1 = 0, demoniator2 = 0;
-  for (int i = 0; i < patch_size; i++)
-  {
-    double n = (ref_patch[i] - mean_ref) * (cur_patch[i] - mean_curr);
-    numerator += n;
-    demoniator1 += (ref_patch[i] - mean_ref) * (ref_patch[i] - mean_ref);
-    demoniator2 += (cur_patch[i] - mean_curr) * (cur_patch[i] - mean_curr);
-  }
-  return numerator / sqrt(demoniator1 * demoniator2 + 1e-10);
 }
 
 void VisualCamera::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map)
@@ -757,16 +736,6 @@ void VisualCamera::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar>
       const double error = flivo::centeredPatchError(patch_wrap.data(), current_patch, patch_size_total,
           inverse_composition_en ? 1.0 : ref_ftr->inv_expo_time_,
           inverse_composition_en ? 1.0 : state->exposure(camera_index), noise_weight);
-
-      if (ncc_en)
-      {
-        double ncc = calculateNCC(patch_wrap.data(), current_patch, patch_size_total);
-        if (ncc < ncc_thre)
-        {
-          // grid_num[i] = TYPE_UNKNOWN;
-          continue;
-        }
-      }
 
       if (error > outlier_threshold * patch_size_total) continue;
 
@@ -1446,7 +1415,7 @@ void VisualCamera::buildResiduals(cv::Mat img, int level, const vector<double> &
   }
 }
 
-void VisualCamera::updateFrameState(StatesGroup state)
+void VisualCamera::updateFrameState(const StatesGroup &state)
 {
   M3D Rwi(state.rot_end);
   V3D Pwi(state.pos_end);
@@ -1455,47 +1424,19 @@ void VisualCamera::updateFrameState(StatesGroup state)
   new_frame_->T_f_w_ = SE3(Rcw, Pcw);
 }
 
-void VisualCamera::plotTrackedPoints()
+const cv::Mat &VisualCamera::trackingImage()
 {
-  int total_points = visual_submap->voxel_points.size();
-  if (total_points == 0) return;
-  // int inlier_count = 0;
-  // for (int i = 0; i < img_cp.rows / grid_size; i++)
-  // {
-  //   cv::line(img_cp, cv::Poaint2f(0, grid_size * i), cv::Point2f(img_cp.cols, grid_size * i), cv::Scalar(255, 255, 255), 1, CV_AA);
-  // }
-  // for (int i = 0; i < img_cp.cols / grid_size; i++)
-  // {
-  //   cv::line(img_cp, cv::Point2f(grid_size * i, 0), cv::Point2f(grid_size * i, img_cp.rows), cv::Scalar(255, 255, 255), 1, CV_AA);
-  // }
-  // for (int i = 0; i < img_cp.rows / grid_size; i++)
-  // {
-  //   cv::line(img_cp, cv::Point2f(0, grid_size * i), cv::Point2f(img_cp.cols, grid_size * i), cv::Scalar(255, 255, 255), 1, CV_AA);
-  // }
-  // for (int i = 0; i < img_cp.cols / grid_size; i++)
-  // {
-  //   cv::line(img_cp, cv::Point2f(grid_size * i, 0), cv::Point2f(grid_size * i, img_cp.rows), cv::Scalar(255, 255, 255), 1, CV_AA);
-  // }
-  for (int i = 0; i < total_points; i++)
+  if (tracked_pixels.empty()) return img_rgb;
+  if (tracking_image.empty())
   {
-    VisualPoint *pt = visual_submap->voxel_points[i];
-    V2D pc(new_frame_->w2c(pt->pos_));
-
-    if (visual_submap->errors[i] <= visual_submap->propa_errors[i])
+    tracking_image = img_rgb.clone();
+    for (const auto &[pixel, inlier] : tracked_pixels)
     {
-      // inlier_count++;
-      cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 7, cv::Scalar(0, 255, 0), -1, 8); // Green Sparse Align tracked
-    }
-    else
-    {
-      cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 7, cv::Scalar(255, 0, 0), -1, 8); // Blue Sparse Align tracked
+      const cv::Scalar color = inlier ? cv::Scalar(0, 255, 0) : cv::Scalar(255, 0, 0);
+      cv::circle(tracking_image, pixel, 7, color, -1, 8);
     }
   }
-  // std::string text = std::to_string(inlier_count) + " " + std::to_string(total_points);
-  // cv::Point2f origin;
-  // origin.x = img_cp.cols - 110;
-  // origin.y = 20;
-  // cv::putText(img_cp, text, origin, cv::FONT_HERSHEY_COMPLEX, 0.7, cv::Scalar(0, 255, 0), 2, 8, 0);
+  return tracking_image;
 }
 
 V3F VisualCamera::getInterpolatedPixel(cv::Mat img, V2D pc)
@@ -1547,13 +1488,20 @@ void VisualCamera::prepareFrame(const MeasureGroup::Image &image, vector<pointWi
 {
   image_timestamp = image.timestamp;
   image_timestamp_ns = image.timestamp_ns;
-  cv::Mat img = image.pixels.clone();
-  if (img.empty()) throw std::runtime_error("Empty camera image: " + id);
-  if (width != img.cols || height != img.rows)
-    cv::resize(img, img, cv::Size(img.cols * image_resize_factor, img.rows * image_resize_factor), 0, 0, CV_INTER_LINEAR);
-  if (width != img.cols || height != img.rows) throw std::runtime_error("Camera image/calibration size mismatch: " + id);
-  img_rgb = img.clone(); img_cp = img.clone();
-  if (img.channels() == 3) cv::cvtColor(img, img, CV_BGR2GRAY);
+  const cv::Mat &input = image.pixels;
+  if (input.empty()) throw std::runtime_error("Empty camera image: " + id);
+  cv::Mat color;
+  if (width == input.cols && height == input.rows)
+    color = input.clone();
+  else
+    cv::resize(input, color, cv::Size(input.cols * image_resize_factor, input.rows * image_resize_factor), 0, 0, CV_INTER_LINEAR);
+  img_rgb = std::move(color);
+  if (width != img_rgb.cols || height != img_rgb.rows) throw std::runtime_error("Camera image/calibration size mismatch: " + id);
+  tracking_image.release();
+  tracked_pixels.clear();
+  cv::Mat img;
+  if (img_rgb.channels() == 3) cv::cvtColor(img_rgb, img, CV_BGR2GRAY);
+  else img = img_rgb;
   if (image_store) {
     current_image_backing = image_store->Store(img);
     img = current_image_backing->pixels;
@@ -1572,15 +1520,23 @@ void VisualCamera::prepareFrame(const MeasureGroup::Image &image, vector<pointWi
   if (!inverse_composition_en)
     for (int i = 0; i < total_points; ++i)
       noise_weights[i] = flivo::photometricSqrtInformation(state->exposure(camera_index), visual_submap->inv_expo_list[i]);
-  compute_jacobian_time = update_ekf_time = 0;
 }
 
 void VisualCamera::finishFrame(vector<pointWithVar> &pg,
-                              const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map)
+                              const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map, bool is_anchor)
 {
   updateFrameState(*state);
   generateVisualMapPoints(gray, pg);
-  plotTrackedPoints();
+  if (is_anchor)
+  {
+    // Snapshot projected pixels before the visual map or sliding window can change.
+    tracked_pixels.reserve(visual_submap->voxel_points.size());
+    for (size_t i = 0; i < visual_submap->voxel_points.size(); ++i)
+    {
+      const V2D px = new_frame_->w2c(visual_submap->voxel_points[i]->pos_);
+      tracked_pixels.emplace_back(cv::Point2f(px[0], px[1]), visual_submap->errors[i] <= visual_submap->propa_errors[i]);
+    }
+  }
   if (plot_flag) projectPatchFromRefToCur(map);
   updateVisualMapPoints(gray);
   updateReferencePatch(map);

@@ -44,18 +44,27 @@ void StartupReplay::retainImuForInitialization(const sensor_msgs::Imu::ConstPtr 
 
 StartupReplay::Index StartupReplay::index(const LidarMeasureGroup &group) const
 {
-  const auto &m=group.measures.back();
+  const auto &m=group.measure;
   Index result{group.last_lio_update_time,group.lio_vio_flg==LIO?m.lio_time:m.vio_time,
       1469598103934665603ULL,group.pcl_proc_cur->size(),m.images.size(),int(group.lio_vio_flg)};
   auto append=[&](const void *p,size_t n){result.fingerprint=flivo_trace::hashBytes(p,n,result.fingerprint);};
   append(&result.flag,sizeof(result.flag)); append(&result.begin,sizeof(result.begin)); append(&result.end,sizeof(result.end));
   for (const auto &p : group.pcl_proc_cur->points)
   { const float values[]={p.x,p.y,p.z,p.intensity,p.curvature}; append(values,sizeof(values)); }
-  for (const auto &imu : m.imu)
+  const auto hash_imu = [&](const auto &samples) {
+    for (const auto &imu : samples)
+    {
+      std::vector<uint8_t> data(ros::serialization::serializationLength(*imu));
+      ros::serialization::OStream stream(data.data(),data.size()); ros::serialization::serialize(stream,*imu);
+      append(data.data(),data.size());
+    }
+  };
+  hash_imu(m.imu);
+  if (!m.camera_imu.empty())
   {
-    std::vector<uint8_t> data(ros::serialization::serializationLength(*imu));
-    ros::serialization::OStream stream(data.data(),data.size()); ros::serialization::serialize(stream,*imu);
-    append(data.data(),data.size());
+    const size_t size = m.camera_imu.size();
+    append(&size, sizeof(size));
+    hash_imu(m.camera_imu);
   }
   for (const auto &image : m.images)
   {

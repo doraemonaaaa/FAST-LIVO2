@@ -13,7 +13,7 @@
 // Register endpoint clouds to consecutive scans; fit motion in the window anchor frame.
 class MotionInitializer {
 public:
-  void setBias(const V3D &bg,const V3D &ba,double scale) {bias_seeded_=true;bg_=bg;ba_=ba;scale_=scale;}
+  void setBias(const V3D &bg,const V3D &ba,double scale) {bg_=bg;ba_=ba;scale_=scale;}
   using PoseMatrix = Eigen::Matrix<double,6,6>;
   using PoseVector = Eigen::Matrix<double,6,1>;
   explicit MotionInitializer(bool timeout_fallback=false, double velocity_sigma=1.0, bool estimate_gravity=true)
@@ -44,6 +44,12 @@ public:
     out.covariance=H.inverse()+M3D::Identity()*.01;
     out.valid=out.initial.allFinite() && out.covariance.allFinite() && out.error<.08;
     return out;
+  }
+  // Both the information and the rotation difference use anchor-frame axes.
+  static constexpr double integration_gyro_sigma=0.003490658503988659; // radians, 0.2 degrees
+  static M3D integrationRotationGain(const M3D &lidar_information) {
+    return (lidar_information+M3D::Identity()/(integration_gyro_sigma*integration_gyro_sigma))
+              .ldlt().solve(lidar_information);
   }
   Result update(const PointCloudXYZI &scan, double begin, double end,
                 const std::deque<sensor_msgs::Imu::ConstPtr> &imus,
@@ -85,20 +91,18 @@ public:
         resetWindow();
         return update(scan,begin,end,imus,R_LI,t_LI);
       }
-      Eigen::Quaterniond qi(im->orientation.w,im->orientation.x,im->orientation.y,im->orientation.z);
-      if(im->orientation_covariance[0]<0 || !qi.coeffs().allFinite() || std::abs(qi.norm()-1)>.01)
-        throw std::runtime_error("motion initialization: invalid attitude in window");
       const V3D acceleration=scale_*V3D(im->linear_acceleration.x,im->linear_acceleration.y,im->linear_acceleration.z)-ba_;
       const V3D omega=V3D(im->angular_velocity.x,im->angular_velocity.y,im->angular_velocity.z)-bg_;
+      if(!omega.allFinite()) throw std::runtime_error("motion initialization: invalid angular velocity");
       const V3D midpoint=.5*(previous_omega_+omega);
       gyro_rotation_=gyro_rotation_*Exp(midpoint,dt);previous_omega_=omega;
       if(!acceleration.allFinite()) throw std::runtime_error("motion initialization: invalid acceleration");
-      const M3D sample_rotation=bias_seeded_?gyro_rotation_:(anchor.conjugate()*qi.normalized()).toRotationMatrix();
-      pending_imus.push_back({time,sample_rotation,acceleration});
+      if(!omega.allFinite()) throw std::runtime_error("motion initialization: invalid angular velocity");
+      pending_imus.push_back({time,gyro_rotation_,acceleration});
       previous_time=time;
     }
     // End-of-scan attitude, rotational deskew, and the latest independent velocity estimate.
-    const M3D imu_rotation=bias_seeded_?gyro_rotation_:(anchor.conjugate()*q).toRotationMatrix();
+    const M3D imu_rotation=gyro_rotation_;
     M3D relative_rotation=last_imu_rotation.transpose()*imu_rotation;
     const M3D endpoint_prior=last_rotation*relative_rotation;
     const V3D endpoint_velocity=endpoint_prior.transpose()*velocity_guess;
@@ -136,7 +140,13 @@ public:
     V3D relative_translation=last_rotation.transpose()*velocity_guess*(end-last_scan_time);
     PoseMatrix H=PoseMatrix::Zero();double rms=0;int count=0;
     size_t plane_candidates=0;
-    for(int iteration=0;iteration<20;++iteration) {
+    const M3D gyro_target=last_rotation.transpose()*imu_rotation;
+    constexpr double lidar_variance=.03*.03;
+    constexpr double registration_sigma=0.05235987755982989; // radians, 3 degrees
+    const double prior_weight=lidar_variance/(registration_sigma*registration_sigma);
+    PoseMatrix registration_H;
+    bool converged=false;
+    for(int iteration=0;iteration<=20;++iteration) {
       H.setZero();PoseVector gradient=PoseVector::Zero();double squared=0;count=0;
       plane_candidates=0;
       for(const auto &pt:*reduced) {
@@ -153,28 +163,32 @@ public:
         H+=weight*J*J.transpose();gradient+=weight*J*r;squared+=r*r;++count;
       }
       if(count<100)return reject_pair();
-      if((H.diagonal().array()<=1e-9).any())return reject_pair();
-      // Normalize rotation/translation units before checking six-DoF rank.
-      const PoseMatrix scale=H.diagonal().cwiseSqrt().cwiseInverse().asDiagonal();
-      Eigen::SelfAdjointEigenSolver<PoseMatrix> es(scale*H*scale);
-      out.eigen_ratio=es.eigenvalues().minCoeff()/es.eigenvalues().maxCoeff();
-      if(out.eigen_ratio<.005)return reject_pair();
-      PoseVector step=-H.ldlt().solve(gradient);
+      registration_H=H;
+      registration_H.topLeftCorner<3,3>().diagonal().array()+=prior_weight;
+      rms=std::sqrt(squared/count);
+      if(converged || iteration==20) break; // H now describes the returned pose.
+      gradient.head<3>()+=prior_weight*Log(M3D(gyro_target.transpose()*relative_rotation));
+      PoseVector step=-registration_H.ldlt().solve(gradient);
       if(!step.allFinite() || step.head<3>().norm()>.2 || step.tail<3>().norm()>.75)return reject_pair();
       relative_rotation=relative_rotation*Exp(V3D(step.head<3>()));
       relative_translation+=step.tail<3>();
-      rms=std::sqrt(squared/count);
-      if(step.head<3>().norm()<1e-5 && step.tail<3>().norm()<1e-4)break;
+      converged=step.head<3>().norm()<1e-5 && step.tail<3>().norm()<1e-4;
     }
     out.match_ratio=plane_candidates ? double(count)/plane_candidates : 0.;
     out.residual=rms;
     if(out.match_ratio<.20 || rms>.10)return reject_pair();
-    if(!setTarget(reduced)) return reject_pair();
+    const M3D Hrt=H.topRightCorner<3,3>();
+    const M3D Htt=H.bottomRightCorner<3,3>();
+    const M3D trans_info=Htt-Hrt.transpose()*registration_H.topLeftCorner<3,3>().ldlt().solve(Hrt);
+    Eigen::SelfAdjointEigenSolver<M3D> es(trans_info);
+    if(es.info()!=Eigen::Success || es.eigenvalues().maxCoeff()<=0) return reject_pair();
+    out.eigen_ratio=es.eigenvalues().minCoeff()/es.eigenvalues().maxCoeff();
+    if(out.eigen_ratio<.005 || !setTarget(reduced)) return reject_pair();
 
     const V3D translation=last_translation+last_rotation*relative_translation;
     const M3D R=(Eigen::Quaterniond(last_rotation)*Eigen::Quaterniond(relative_rotation))
                     .normalized().toRotationMatrix();
-    const PoseMatrix pair_covariance=H.ldlt().solve(PoseMatrix::Identity())*(double(count)*.03*.03);
+    const PoseMatrix pair_covariance=registration_H.ldlt().solve(PoseMatrix::Identity())*(double(count)*.03*.03);
     // Weight each observation by its pairwise registration quality in the anchor axes.
     const M3D info=last_rotation*pair_covariance.bottomRightCorner<3,3>().inverse()*last_rotation.transpose();
     // ESIKF consumes endpoint pose uncertainty, including preceding increments.
@@ -187,11 +201,31 @@ public:
     out.pose_covariance=previous_jacobian*last_pose_covariance*previous_jacobian.transpose()
                         +pair_jacobian*pair_covariance*pair_jacobian.transpose();
     last_pose_covariance=out.pose_covariance;
-    integrateAcceptedMotion(R,imu_rotation,gravity,end);
+    // H uses right increments in scan coordinates. Rotate its marginal
+    // information into the anchor frame of the left correction R * gyro^-1.
+    const M3D marginal=H.topLeftCorner<3,3>()-Hrt*Htt.ldlt().solve(Hrt.transpose());
+    const M3D rotation_info=R*(.5*(marginal+marginal.transpose()))*R.transpose()/(count*lidar_variance);
+    const V3D difference=Log(M3D(R*imu_rotation.transpose()));
+    out.rotation_correction=difference.norm();
+    if(out.rotation_correction>0.17453292519943295) return reject_pair();
+    const M3D gain=integrationRotationGain(rotation_info);
+    const V3D correction=gain*difference;
+    if(!correction.allFinite()) return reject_pair();
+    const M3D integration_correction=Exp(correction,1.0);
+    const M3D fused_rotation=integration_correction*imu_rotation;
+    // The ESIKF uses a right rotation error and additive anchor-frame position.
+    // Apply the same directional gain to attitude and its position cross-covariance.
+    // Keep last_pose_covariance in the raw scan chain for the next registration.
+    PoseMatrix to_fused=PoseMatrix::Identity();
+    to_fused.topLeftCorner<3,3>()=fused_rotation.transpose()*gain*R;
+    const M3D gyro_noise=integration_gyro_sigma*fused_rotation.transpose()*(M3D::Identity()-gain);
+    out.pose_covariance=to_fused*last_pose_covariance*to_fused.transpose();
+    out.pose_covariance.topLeftCorner<3,3>()+=gyro_noise*gyro_noise.transpose();
+    integrateAcceptedMotion(integration_correction,gravity,end);
+    last_integration_correction_=integration_correction;
     observations.push_back({out.elapsed,translation,dp,dv,info});
     last_translation=translation;last_scan_time=end;last_rotation=R;last_imu_rotation=imu_rotation;
-    out.position=translation;out.rotation=R;out.gravity=gravity;
-    out.rotation_correction=Log(M3D(imu_rotation.transpose()*R)).norm();
+    out.position=translation;out.rotation=fused_rotation;out.gravity=gravity;
     if(out.elapsed>.15)velocity_guess=(translation-dp)/out.elapsed+dv;
     if(out.elapsed<.8)return out;
     if(estimate_gravity_) {
@@ -216,12 +250,12 @@ public:
     auto fitted=fit(observations);out.fit_error=fitted.error;
     if(!fitted.valid)return out;
     out.ready=true;out.position=translation;out.velocity=fitted.initial+dv;
-    out.rotation=R;out.gravity=gravity;out.velocity_cov=fitted.covariance;
+    out.rotation=fused_rotation;out.gravity=gravity;out.velocity_cov=fitted.covariance;
     return out;
   }
 private:
   PoseMatrix last_pose_covariance=PoseMatrix::Zero();
-  bool bias_seeded_=false;
+  M3D last_integration_correction_=M3D::Identity();
   V3D bg_=V3D::Zero(),ba_=V3D::Zero(),previous_omega_=V3D::Zero();
   double scale_=1.;
   M3D gyro_rotation_=M3D::Identity();
@@ -229,9 +263,9 @@ private:
   std::vector<InertialSample> pending_imus;
   InertialSample last_sample{0,M3D::Identity(),V3D::Zero()};
   M3D last_rotation=M3D::Identity(),last_imu_rotation=M3D::Identity();
-  void integrateAcceptedMotion(const M3D &rotation,const M3D &imu_rotation,const V3D &gravity,double end) {
-    const Eigen::Quaterniond first(last_rotation*last_imu_rotation.transpose());
-    const Eigen::Quaterniond last(rotation*imu_rotation.transpose());
+  void integrateAcceptedMotion(const M3D &correction,const V3D &gravity,double end) {
+    const Eigen::Quaterniond first(last_integration_correction_);
+    const Eigen::Quaterniond last(correction);
     double cursor=last_scan_time;
     auto advance=[&](const InertialSample &sample,double time) {
       if(time<=cursor)return;
@@ -272,7 +306,7 @@ private:
     start=previous_time=last_scan_time=-1;target.reset();grid.clear();normals.clear();centers.clear();observations.clear();
     previous_acc.setZero();dp.setZero();dv.setZero();velocity_guess.setZero();last_translation.setZero();
     pending_imus.clear();last_rotation.setIdentity();last_imu_rotation.setIdentity();
-    last_pose_covariance.setZero();
+    last_pose_covariance.setZero();last_integration_correction_.setIdentity();
     gravity_stable_windows_=0;last_fit_gravity_.setZero();
   }
   double first_attempt=-1,start=-1,previous_time=-1,last_scan_time=-1;

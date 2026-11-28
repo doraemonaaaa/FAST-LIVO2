@@ -1,6 +1,7 @@
 #include "LIVMapper.h"
 #include "camera_sync.h"
 #include "camera_events.h"
+#include "imu_support.h"
 #include <vikit/camera_loader.h>
 #include <regex>
 #include <filesystem>
@@ -36,6 +37,10 @@ void LIVMapper::configureCameras()
   nh.param<string>("camera_sync/lio_clock",lio_clock,"camera");
   if(lio_clock!="camera" && lio_clock!="scan")throw std::runtime_error("lio_clock must be camera or scan");
   scan_clock=lio_clock=="scan";
+  nh.param<bool>("camera_sync/compensate_exposure_time", compensate_exposure_time, false);
+  joint_camera_posterior = !sequential_camera_updates && img_en && lidar_en && order.size() > 1;
+  if (compensate_exposure_time && (sequential_camera_updates || !imu_en))
+    throw std::runtime_error("Exposure-time compensation requires joint camera-clock updates with IMU");
   if(scan_clock && !sequential_camera_updates)throw std::runtime_error("scan clock requires sequential mode");
   if(sequential_camera_updates && !imu_en)
     throw std::runtime_error("Sequential camera updates require IMU propagation");
@@ -117,7 +122,8 @@ void LIVMapper::configureCameras()
   }
   vio_manager->audit.open(string(ROOT_DIR) + "Log/camera_observations.csv");
   if (!vio_manager->audit) throw std::runtime_error("Cannot open camera observation audit");
-  vio_manager->audit << "timestamp,camera,retrieved,used,inv_exposure,covariance_trace\n";
+  vio_manager->audit << "timestamp,camera,retrieved,used,inv_exposure,covariance_trace,"
+                    << "reference_timestamp,projection_timestamp,imu_translation_m,imu_rotation_rad\n";
   if(sequential_camera_updates) {
     camera_events_log.open(string(ROOT_DIR)+"Log/camera_events.csv");
     if(!camera_events_log)throw std::runtime_error("Cannot open camera event audit");
@@ -126,6 +132,11 @@ void LIVMapper::configureCameras()
     camera_input_log.open(string(ROOT_DIR)+"Log/camera_input.csv");
     if(!camera_event_frames_log || !camera_input_log)throw std::runtime_error("Cannot open asynchronous camera audit");
     camera_input_log<<"camera,timestamp_ns,decision\n";
+  }
+  else if (nh.hasParam("camera_pose_export"))
+  {
+    camera_event_frames_log.open(string(ROOT_DIR) + "Log/camera_pose_observations.jsonl");
+    if (!camera_event_frames_log) throw std::runtime_error("Cannot open camera pose audit");
   }
 }
 
@@ -146,12 +157,9 @@ void LIVMapper::img_cbk(const sensor_msgs::ImageConstPtr &msg, size_t camera_ind
   if (time < queue.last_timestamp) throw std::runtime_error("Image time went backwards: " + camera.id);
   if (!sequential_camera_updates && time - queue.last_timestamp < .02) return;
   std::lock_guard<std::mutex> lock(mtx_buffer);
-  queue.images.push_back(getImageFromMsg(msg));
-  queue.times.push_back(time);
-  queue.stamps.push_back(msg->header.stamp.toNSec() + int64_t(std::llround((camera.time_offset + camera.exposure_time_offset) * 1e9)));
+  queue.frames.push_back({camera_index, time, getImageFromMsg(msg), stamp});
   queue.last_timestamp = time;
   record("queued");
-  sig_buffer.notify_all();
 }
 
 bool LIVMapper::prepareImageBundle(double timestamp)
@@ -162,19 +170,36 @@ bool LIVMapper::prepareImageBundle(double timestamp)
   vector<double> first, last;
   for (auto &queue : camera_queues)
   {
-    while (!queue.times.empty() && queue.times.front() < timestamp - vio_manager->sync_tolerance)
-    { queue.times.pop_front(); queue.images.pop_front(); queue.stamps.pop_front(); }
-    first.push_back(queue.times.empty() ? std::numeric_limits<double>::infinity() : queue.times.front());
+    while (!queue.frames.empty() && queue.frames.front().timestamp < timestamp - vio_manager->sync_tolerance)
+      queue.frames.pop_front();
+    first.push_back(queue.frames.empty() ? std::numeric_limits<double>::infinity() : queue.frames.front().timestamp);
     last.push_back(queue.last_timestamp);
   }
   if (!cameraBundleReady(timestamp, first, last, vio_manager->sync_tolerance, camera_maximum_lateness, finished))
     return false;
   vector<MeasureGroup::Image> images;
-  for (size_t k = 0; k < camera_queues.size(); ++k)
+  for (const auto &queue : camera_queues)
   {
-    auto &queue = camera_queues[k];
-    if (!queue.times.empty() && abs(queue.times.front() - timestamp) <= vio_manager->sync_tolerance)
-      images.push_back({k, queue.times.front(), queue.images.front(), queue.stamps.front()});
+    if (!queue.frames.empty() && abs(queue.frames.front().timestamp - timestamp) <= vio_manager->sync_tolerance)
+      images.push_back(queue.frames.front());
+  }
+  pending_camera_imu.clear();
+  if (compensate_exposure_time)
+  {
+    double begin = timestamp, end = timestamp;
+    for (const auto &image : images)
+    {
+      const double first_time = std::min(timestamp, image.timestamp);
+      const double last_time = std::max(timestamp, image.timestamp);
+      const auto coverage = imu_support::Check(scan_imu_history, first_time, last_time);
+      if (coverage == imu_support::Coverage::MissingEnd && !finished) return false;
+      if (coverage == imu_support::Coverage::Covered)
+      {
+        begin = std::min(begin, first_time);
+        end = std::max(end, last_time);
+      }
+    }
+    pending_camera_imu = imuBracket(begin, end);
   }
   pending_images = std::move(images);
   return true;
@@ -185,9 +210,10 @@ void LIVMapper::consumeImageBundle()
   for (const auto &image : pending_images)
   {
     auto &queue = camera_queues.at(image.camera_index);
-    if (queue.times.empty() || queue.times.front() != image.timestamp)
+    if (queue.frames.empty() || queue.frames.front().timestamp_ns != image.timestamp_ns ||
+        queue.frames.front().timestamp != image.timestamp)
       throw std::runtime_error("Finalized camera bundle changed before consumption");
-    queue.times.pop_front(); queue.images.pop_front(); queue.stamps.pop_front();
+    queue.frames.pop_front();
   }
   pending_images.clear();
 }
@@ -220,15 +246,16 @@ void LIVMapper::saveCameraImages(const string &stamp, double timestamp, double b
   camera_frames_log << "]}\n" << std::flush;
 }
 
-void LIVMapper::saveCameraEvent()
+void LIVMapper::saveCameraEvent(bool save_images)
 {
-  for(const auto &image:LidarMeasures.measures.back().images) {
+  const bool write_image = save_images && img_save_en;
+  for(const auto &image:LidarMeasures.measure.images) {
     auto &camera=*vio_manager->cameras.at(image.camera_index);
     if(!camera.new_frame_)throw std::runtime_error("Camera event has no observation pose");
     const bool anchor=image.camera_index==vio_manager->anchor_index;
     std::ostringstream stamp;stamp<<std::fixed<<std::setprecision(anchor?6:9)<<image.timestamp;
     const string path="image/"+(anchor?string():camera.id+"/")+stamp.str()+".png";
-    if(img_save_en && !std::filesystem::exists(string(ROOT_DIR)+"Log/"+path) &&
+    if(write_image && !std::filesystem::exists(string(ROOT_DIR)+"Log/"+path) &&
         !cv::imwrite(string(ROOT_DIR)+"Log/"+path,camera.img_rgb))
       throw std::runtime_error("Cannot save asynchronous camera image");
     const auto &s=camera.observation_state;
@@ -236,7 +263,7 @@ void LIVMapper::saveCameraEvent()
     const Eigen::Quaterniond qc(pose.rotation_matrix()),qi(s.rot_end);
     camera_event_frames_log<<std::setprecision(17)<<"{\"timestamp_ns\":"<<image.timestamp_ns
       <<",\"camera_id\":\""<<camera.id<<"\",\"state_timestamp_ns\":"<<int64_t(std::llround(camera.state_timestamp*1e9))
-      <<",\"path\":\"raw/"<<path<<"\",\"image_saved\":"<<(img_save_en?"true":"false")
+      <<",\"path\":\"raw/"<<path<<"\",\"image_saved\":"<<(write_image?"true":"false")
       <<",\"T_W_C\":{\"translation_m\":["<<pose.translation().x()<<','<<pose.translation().y()<<','<<pose.translation().z()
       <<"],\"quaternion_xyzw\":["<<qc.x()<<','<<qc.y()<<','<<qc.z()<<','<<qc.w()<<"]}"
       <<",\"T_W_I\":{\"translation_m\":["<<s.pos_end.x()<<','<<s.pos_end.y()<<','<<s.pos_end.z()

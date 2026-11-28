@@ -60,12 +60,16 @@ bool LIVMapper::sync_packages(LidarMeasureGroup& meas) {
   if(imu_en)filterImuCoveredScans();
   if(!syncRawPackages(meas))return false;
   if(imu_en) {
-    auto& m=meas.measures.back();const double end=meas.lio_vio_flg==LIO?m.lio_time:m.vio_time;
+    auto& m=meas.measure;
+    const double end=meas.lio_vio_flg==LIO?m.lio_time:m.vio_time;
     const double begin=last_sync_time<0?meas.last_lio_update_time:
       std::min(meas.last_lio_update_time,last_sync_time);
     // Peek at the first real IMU at/after the target; it remains available for
     // the next event. Within-range interpolation replaces the former hold.
     m.imu=imuBracket(begin,end);
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    while (!imu_buffer.empty() && imu_support::Time(imu_buffer.front()) <= end)
+      imu_buffer.pop_front();
     last_sync_time=end;
   }
   return true;

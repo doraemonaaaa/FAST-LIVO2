@@ -13,6 +13,8 @@ which is included as part of this source code package.
 #ifndef VIO_H_
 #define VIO_H_
 
+#include "camera_imu_motion.h"
+
 #include "voxel_map.h"
 #include "feature.h"
 #include "memory_mode/page/image_backing.h"
@@ -108,14 +110,13 @@ public:
   M3D Rli, Rci, Rcl, Rcw, Jdphi_dR, Jdp_dt, Jdp_dR;
   V3D Pli, Pci, Pcl, Pcw;
   vector<int> grid_num;
-  vector<int> map_index;
   vector<int> border_flag;
   vector<int> update_flag;
   vector<float> map_dist;
   vector<float> scan_value;
   vector<float> patch_buffer;
   bool normal_en, inverse_composition_en, exposure_estimate_en, raycast_en, has_ref_patch_cache;
-  bool ncc_en = false, colmap_output_en = false;
+  bool colmap_output_en = false;
 
   int width, height, grid_n_width, grid_n_height, length;
   double image_resize_factor;
@@ -123,15 +124,10 @@ public:
   int patch_pyrimid_level, patch_size, patch_size_total, patch_size_half, border, warp_len;
   int max_iterations, total_points;
 
-  double img_point_cov, outlier_threshold, ncc_thre;
+  double img_point_cov, outlier_threshold;
   
   SubSparseMap *visual_submap;
   std::vector<std::vector<V3D>> rays_with_sample_points;
-
-  double compute_jacobian_time, update_ekf_time;
-  double ave_total = 0;
-  // double ave_build_residual_time = 0;
-  // double ave_ekf_time = 0;
 
   int frame_count = 0;
   bool plot_flag;
@@ -150,7 +146,9 @@ public:
   vector<VisualPoint *> retrieve_voxel_points;
   vector<pointWithVar> append_voxel_points;
   FramePtr new_frame_;
-  cv::Mat img_cp, img_rgb, img_test;
+  cv::Mat img_rgb;
+  std::vector<std::pair<cv::Point, bool>> tracked_pixels;
+  cv::Mat tracking_image;
 
   enum CellType
   {
@@ -167,7 +165,8 @@ public:
                             vector<float> &errors, vector<int> &counts);
   void prepareFrame(const MeasureGroup::Image &image, vector<pointWithVar> &pg,
                     const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map);
-  void finishFrame(vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map);
+  void finishFrame(vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map,
+                   bool is_anchor);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
@@ -186,13 +185,12 @@ public:
   void warpAffine(const Matrix2d &A_cur_ref, const cv::Mat &img_ref, const Vector2d &px_ref, const int level_ref, const int search_level,
                   const int pyramid_level, const int halfpatch_size, float *patch);
   bool insertPointIntoVoxelMap(VisualPoint *pt_new);
-  void plotTrackedPoints();
-  void updateFrameState(StatesGroup state);
+  const cv::Mat &trackingImage();
+  void updateFrameState(const StatesGroup &state);
   void projectPatchFromRefToCur(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void precomputeReferencePatches(int level);
   void dumpDataForColmap();
-  double calculateNCC(float *ref_patch, float *cur_patch, int patch_size);
   int getBestSearchLevel(const Matrix2d &A_cur_ref, const int max_level);
   V3F getInterpolatedPixel(cv::Mat img, V2D pc);
   
@@ -224,8 +222,9 @@ public:
   void clearStartupMap();
   void processFrame(const vector<MeasureGroup::Image> &images, vector<pointWithVar> &pg,
                     const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &map,
-                    double reference_time=0,const std::function<void(double)> &advance={});
-  void computeJacobianAndUpdateEKF();
+                    double reference_time=0,const std::function<void(double)> &advance={},
+                    const vector<flivo::CameraImuMotion> &motion={});
+  void computeJacobianAndUpdateEKF(const vector<flivo::CameraImuMotion> &motion);
 };
 typedef std::shared_ptr<VIOManager> VIOManagerPtr;
 

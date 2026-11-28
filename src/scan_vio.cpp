@@ -28,7 +28,7 @@ bool LIVMapper::syncScanEvent(LidarMeasureGroup &meas)
     std::lock_guard<std::mutex> lock(mtx_buffer);
     vector<double> first,last;
     for(const auto &q:camera_queues) {
-      first.push_back(q.times.empty()?std::numeric_limits<double>::infinity():q.times.front());
+      first.push_back(q.frames.empty()?std::numeric_limits<double>::infinity():q.frames.front().timestamp);
       last.push_back(q.last_timestamp);
     }
     scan_ready=cameraEventReady(end,first,last,coverage,camera_maximum_lateness,eof);
@@ -53,16 +53,9 @@ bool LIVMapper::syncScanEvent(LidarMeasureGroup &meas)
     meas.lio_vio_flg=VIO;sequential_anchor_event=false;
     {std::lock_guard<std::mutex> lock(mtx_buffer);consumeImageBundle();}
     last_camera_event_stamp=m.images.front().timestamp_ns;
-    last_camera_event_time=image_time;
   }
-  const double target=meas.lio_vio_flg==LIO?m.lio_time:m.vio_time;
-  {
-    std::lock_guard<std::mutex> lock(mtx_buffer);
-    while(!imu_buffer.empty() && imu_buffer.front()->header.stamp.toSec()<=target) {
-      m.imu.push_back(imu_buffer.front());imu_buffer.pop_front();
-    }
-  }
-  meas.measures.clear();meas.measures.push_back(m);sig_buffer.notify_all();return true;
+  meas.measure = std::move(m);
+  return true;
 }
 
 void LIVMapper::processScanImu()
@@ -78,11 +71,11 @@ void LIVMapper::processScanImu()
     LidarMeasures.last_lio_update_time=propagation.last_lio_update_time;
     if(lidar) {
       deque<sensor_msgs::Imu::ConstPtr> samples;
-      const double end=LidarMeasures.measures.back().lio_time;
+      const double end=LidarMeasures.measure.lio_time;
       samples=imuBracket(scan_begin,end);
       scan_audit<<std::setprecision(17)<<scan_begin<<','<<end<<','<<LidarMeasures.pcl_proc_cur->size()<<','<<samples.size()<<','
         <<_state.vel_end.norm()<<','<<_state.bias_g.norm()<<','<<_state.bias_a.norm()<<','<<_state.gravity.norm()<<'\n'<<std::flush;
-      p_imu->deskewWholeScan(*LidarMeasures.pcl_proc_cur,scan_begin,end,_state,samples,feats_undistort);
+      p_imu->deskewWholeScan(*LidarMeasures.pcl_proc_cur,scan_begin,end,_state,samples,extR,extT,feats_undistort);
       if(feats_undistort->size()!=LidarMeasures.pcl_proc_cur->size())
         throw std::runtime_error("Whole-scan deskew changed point count");
     }

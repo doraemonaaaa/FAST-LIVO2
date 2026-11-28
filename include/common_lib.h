@@ -61,8 +61,8 @@ enum EKF_STATE
 
 struct MeasureGroup
 {
-  double vio_time;
-  double lio_time;
+  double vio_time = 0.0;
+  double lio_time = 0.0;
   deque<sensor_msgs::Imu::ConstPtr> imu;
   cv::Mat img;
   struct Image
@@ -73,23 +73,7 @@ struct MeasureGroup
     uint64_t timestamp_ns = 0;
   };
   vector<Image> images;
-  void cloneImages()
-  {
-    const auto *primary_data = img.data;
-    bool found = false;
-    for (auto &image : images)
-    {
-      const bool primary = image.pixels.data == primary_data;
-      image.pixels = image.pixels.clone();
-      if (primary) { img = image.pixels; found = true; }
-    }
-    if (!found) img = img.clone();
-  }
-  MeasureGroup()
-  {
-    vio_time = 0.0;
-    lio_time = 0.0;
-  };
+  deque<sensor_msgs::Imu::ConstPtr> camera_imu;
 };
 
 struct LidarMeasureGroup
@@ -100,9 +84,8 @@ struct LidarMeasureGroup
   PointCloudXYZI::Ptr lidar;
   PointCloudXYZI::Ptr pcl_proc_cur;
   PointCloudXYZI::Ptr pcl_proc_next;
-  deque<struct MeasureGroup> measures;
+  MeasureGroup measure;
   EKF_STATE lio_vio_flg;
-  int lidar_scan_index_now;
 
   LidarMeasureGroup()
   {
@@ -113,30 +96,21 @@ struct LidarMeasureGroup
     this->lidar.reset(new PointCloudXYZI());
     this->pcl_proc_cur.reset(new PointCloudXYZI());
     this->pcl_proc_next.reset(new PointCloudXYZI());
-    this->measures.clear();
-    lidar_scan_index_now = 0;
-    last_lio_update_time = -1.0;
   };
 };
 
 typedef struct pointWithVar
 {
   Eigen::Vector3d point_b;     // point in the lidar body frame
-  Eigen::Vector3d point_i;     // point in the imu body frame
   Eigen::Vector3d point_w;     // point in the world frame
-  Eigen::Matrix3d var_nostate; // the var removed the state covarience
   Eigen::Matrix3d body_var;
   Eigen::Matrix3d var;
-  Eigen::Matrix3d point_crossmat;
   Eigen::Vector3d normal;
   pointWithVar()
   {
-    var_nostate = Eigen::Matrix3d::Zero();
     var = Eigen::Matrix3d::Zero();
     body_var = Eigen::Matrix3d::Zero();
-    point_crossmat = Eigen::Matrix3d::Zero();
     point_b = Eigen::Vector3d::Zero();
-    point_i = Eigen::Vector3d::Zero();
     point_w = Eigen::Vector3d::Zero();
     normal = Eigen::Vector3d::Zero();
   };

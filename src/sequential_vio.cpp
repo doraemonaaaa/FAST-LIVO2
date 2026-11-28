@@ -14,22 +14,26 @@ bool LIVMapper::prepareCameraEvent(double &timestamp,double sensor_time,bool eof
   size_t selected=camera_queues.size();timestamp=std::numeric_limits<double>::infinity();
   for(size_t k=0;k<camera_queues.size();++k) {
     auto &q=camera_queues[k];
-    while(!q.times.empty() && (q.times.front()<LidarMeasures.last_lio_update_time || q.stamps.front()<last_camera_event_stamp ||
-          (eof && q.times.front()>sensor_time) ||
-          (q.times.front()<=last_timestamp_imu && imu_support::Check(scan_imu_history,q.times.front(),q.times.front())!=imu_support::Coverage::Covered))) {
-      camera_input_log<<vio_manager->cameras[k]->id<<','<<q.stamps.front()<<','
-          <<(q.times.front()<LidarMeasures.last_lio_update_time || q.stamps.front()<last_camera_event_stamp?"before_state":"outside_sensor_coverage")<<'\n'<<std::flush;
-      q.times.pop_front();q.images.pop_front();q.stamps.pop_front();
+    while (!q.frames.empty()) {
+      const auto &frame = q.frames.front();
+      const bool before_state = frame.timestamp < LidarMeasures.last_lio_update_time ||
+                                frame.timestamp_ns < last_camera_event_stamp;
+      if (!before_state && !(eof && frame.timestamp > sensor_time) &&
+          !(frame.timestamp <= last_timestamp_imu &&
+            imu_support::Check(scan_imu_history,frame.timestamp,frame.timestamp) != imu_support::Coverage::Covered))
+        break;
+      camera_input_log << vio_manager->cameras[k]->id << ',' << frame.timestamp_ns << ','
+                       << (before_state ? "before_state" : "outside_sensor_coverage") << '\n' << std::flush;
+      q.frames.pop_front();
     }
-    const double t=q.times.empty()?std::numeric_limits<double>::infinity():q.times.front();
+    const double t=q.frames.empty()?std::numeric_limits<double>::infinity():q.frames.front().timestamp;
     first.push_back(t);last.push_back(q.last_timestamp);
-    if(std::isfinite(t) && (selected==camera_queues.size() || q.stamps.front()<camera_queues[selected].stamps.front()))
+    if(std::isfinite(t) && (selected==camera_queues.size() || q.frames.front().timestamp_ns<camera_queues[selected].frames.front().timestamp_ns))
       {timestamp=t;selected=k;}
   }
   if(selected==camera_queues.size() || timestamp>sensor_time ||
       !cameraEventReady(timestamp,first,last,sensor_time,camera_maximum_lateness,eof))return false;
-  auto &q=camera_queues[selected];
-  pending_images={{selected,q.times.front(),q.images.front(),q.stamps.front()}};
+  pending_images={camera_queues[selected].frames.front()};
   sequential_anchor_event=selected==vio_manager->anchor_index;
   return true;
 }
@@ -40,10 +44,11 @@ bool LIVMapper::syncCameraEvent(LidarMeasureGroup &meas)
     // The anchor event was reserved before its LIO. No fresh input is needed.
     MeasureGroup m;m.lio_time=meas.last_lio_update_time;m.vio_time=pending_images.front().timestamp;
     m.img=pending_images.front().pixels;m.images=pending_images;
-    meas.measures.clear();meas.measures.push_back(m);meas.lio_vio_flg=VIO;
+    meas.lio_vio_flg=VIO;
     {std::lock_guard<std::mutex> lock(mtx_buffer);consumeImageBundle();}
-    last_camera_event_time=m.vio_time;last_camera_event_stamp=m.images.front().timestamp_ns;
-    sig_buffer.notify_all();return true;
+    last_camera_event_stamp=m.images.front().timestamp_ns;
+    meas.measure = std::move(m);
+    return true;
   }
   if(meas.last_lio_update_time<0) {
     if(lid_header_time_buffer.empty() || !imu_checked_scans)return false;
@@ -57,41 +62,24 @@ bool LIVMapper::syncCameraEvent(LidarMeasureGroup &meas)
   if(!prepareCameraEvent(timestamp,coverage,eof))return false;
   const double begin=meas.last_lio_update_time;
   MeasureGroup m=collectLivoSlice(meas,timestamp);
-  meas.measures.clear();
   bundle_sequential_updates=!sequential_anchor_event;
   if(sequential_anchor_event) {
-    bundle_lio_time=timestamp;meas.lio_vio_flg=LIO;
+    meas.lio_vio_flg=LIO;
   } else {
     m.lio_time=begin;m.vio_time=timestamp;m.img=pending_images.front().pixels;m.images=pending_images;
     meas.lio_vio_flg=VIO;
     {std::lock_guard<std::mutex> lock(mtx_buffer);consumeImageBundle();}
-    last_camera_event_time=timestamp;
     last_camera_event_stamp=m.images.front().timestamp_ns;
   }
-  meas.measures.push_back(m);sig_buffer.notify_all();return true;
+  meas.measure = std::move(m);
+  return true;
 }
 
 MeasureGroup LIVMapper::collectLivoSlice(LidarMeasureGroup &meas,double img_capture_time)
 {
   struct MeasureGroup m;
 
-  // printf("[ Data Cut ] LIO \n");
-  // printf("[ Data Cut ] img_capture_time: %lf \n", img_capture_time);
-  m.imu.clear();
   m.lio_time = img_capture_time;
-  mtx_buffer.lock();
-  while (!imu_buffer.empty())
-  {
-    if (imu_buffer.front()->header.stamp.toSec() > m.lio_time) break;
-
-    if (imu_buffer.front()->header.stamp.toSec() > meas.last_lio_update_time) m.imu.push_back(imu_buffer.front());
-
-    imu_buffer.pop_front();
-    // printf("[ Data Cut ] imu time: %lf \n",
-    // imu_buffer.front()->header.stamp.toSec());
-  }
-  mtx_buffer.unlock();
-  sig_buffer.notify_all();
 
   splitPendingPointsAtImageTime(meas.pcl_proc_next->points, meas.pcl_proc_cur->points,
                                (img_capture_time - meas.last_lio_update_time) * 1000.0);
@@ -105,7 +93,7 @@ MeasureGroup LIVMapper::collectLivoSlice(LidarMeasureGroup &meas,double img_capt
   while (!lid_raw_data_buffer.empty() && (!imu_en || imu_checked_scans))
   {
     if (lid_header_time_buffer.front() > img_capture_time) break;
-    auto pcl(lid_raw_data_buffer.front()->points);
+    const auto &pcl = lid_raw_data_buffer.front()->points;
     double frame_header_time(lid_header_time_buffer.front());
     float max_offs_time_ms = (m.lio_time - frame_header_time) * 1000.0f;
 
@@ -138,7 +126,7 @@ MeasureGroup LIVMapper::collectLivoSlice(LidarMeasureGroup &meas,double img_capt
 
 void LIVMapper::processSequentialVIO(bool visual_support)
 {
-  const auto &measurement=LidarMeasures.measures.back();
+  const auto &measurement=LidarMeasures.measure;
   const double origin=measurement.lio_time;
   double cursor=origin;
   size_t imu_index=0,point_index=0;
@@ -162,7 +150,7 @@ void LIVMapper::processSequentialVIO(bool visual_support)
       point.curvature=(offset-(cursor-origin))*1000.;
       slice.pcl_proc_cur->push_back(point);point_times.push_back(time);
     }
-    slice.measures.push_back(m);
+    slice.measure = m;
     PointCloudXYZI::Ptr deskewed(new PointCloudXYZI());
     constrainGravityBeforePrediction(timestamp);
     p_imu->Process2(slice,_state,deskewed,true);

@@ -300,7 +300,7 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   double t0 = omp_get_wtime();
   pcl_out.clear();
   /*** add the imu of the last frame-tail to the of current frame-head ***/
-  MeasureGroup &meas = lidar_meas.measures.back();
+  MeasureGroup &meas = lidar_meas.measure;
   // cout<<"meas.imu.size: "<<meas.imu.size()<<endl;
   auto acquired=meas.imu;
   if(acquired.empty() || last_imu->header.stamp<acquired.front()->header.stamp)acquired.push_front(last_imu);
@@ -339,7 +339,6 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     IMUpose.clear();
     pcl_wait_proc.resize(lidar_meas.pcl_proc_cur->points.size());
     pcl_wait_proc = *(lidar_meas.pcl_proc_cur);
-    lidar_meas.lidar_scan_index_now = 0;
     IMUpose.push_back(set_pose6d(0.0, acc_s_last, angvel_last, state_inout.vel_end, state_inout.pos_end, state_inout.rot_end));
   }
 
@@ -606,19 +605,14 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
     return;
   }
 
-  MeasureGroup meas = lidar_meas.measures.back();
-  if(imu_need_init) {
+  if (imu_need_init)
+  {
+    MeasureGroup meas = lidar_meas.measure;
     auto samples=meas.imu.empty()?motion_imu_carry:meas.imu;
     if(samples.empty()) {cur_pcl_un_->clear();return;}
     if(!b_first_frame && last_imu->header.stamp<samples.front()->header.stamp)samples.push_front(last_imu);
     const double end=lidar_meas.lio_vio_flg==LIO?meas.lio_time:meas.vio_time;
     meas.imu=imu_support::Clip(samples,lidar_meas.last_lio_update_time,end);
-  }
-
-  if (imu_need_init)
-  {
-    double pcl_end_time = lidar_meas.lio_vio_flg == LIO ? meas.lio_time : meas.vio_time;
-    // lidar_meas.last_lio_update_time = pcl_end_time;
 
     cur_pcl_un_->clear();
     if(motion_initializer && initialization_slice) {
@@ -714,8 +708,8 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
 
     // Startup scans are withheld, but pending points already use this image
     // boundary as their origin. Keep the next slice and propagation consistent.
-    last_prop_end_time = pcl_end_time;
-    lidar_meas.last_lio_update_time = pcl_end_time;
+    last_prop_end_time = end;
+    lidar_meas.last_lio_update_time = end;
     return;
   }
 

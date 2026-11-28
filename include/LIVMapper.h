@@ -21,6 +21,9 @@ which is included as part of this source code package.
 #include <cv_bridge/cv_bridge.h>
 #include <image_transport/image_transport.h>
 #include <nav_msgs/Path.h>
+#include <mutex>
+
+class AuxiliaryLidarExport;
 
 class LIVMapper
 {
@@ -86,7 +89,6 @@ public:
   cv::Mat getImageFromMsg(const sensor_msgs::ImageConstPtr &img_msg);
 
   std::mutex mtx_buffer, mtx_buffer_imu_prop;
-  std::condition_variable sig_buffer;
 
   SLAM_MODE slam_mode_;
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;
@@ -124,8 +126,6 @@ public:
 
   bool gravity_align_en = false, gravity_align_finished = false;
 
-  bool sync_jump_flag = false;
-
   bool lidar_pushed = false, imu_en, gravity_est_en, flg_reset = false, ba_bg_est_en = true;
   bool dense_map_en = false;
   int img_en = 1, imu_int_frame = 3;
@@ -146,14 +146,17 @@ public:
   deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
   struct CameraQueue
   {
-    deque<cv::Mat> images;
-    deque<double> times;
-    deque<uint64_t> stamps;
+    deque<MeasureGroup::Image> frames;
     double last_timestamp = -1;
     int subsample_counter = 0;
   };
   vector<CameraQueue> camera_queues;
   vector<MeasureGroup::Image> pending_images;
+  deque<sensor_msgs::Imu::ConstPtr> pending_camera_imu;
+  bool compensate_exposure_time = false;
+  bool joint_camera_posterior = false;
+  void writeTrajectoryPose();
+  ros::Time outputTimestamp() const;
   double camera_maximum_lateness = 0.5;
   bool sequential_camera_updates = false;
   bool scan_clock = false;
@@ -162,6 +165,7 @@ public:
   ofstream scan_audit;
   double scan_begin = 0;
   deque<sensor_msgs::Imu::ConstPtr> scan_imu_history;
+  std::unique_ptr<AuxiliaryLidarExport> auxiliary_lidar_export;
   size_t imu_checked_scans=0;
   double last_sync_time=-1;
   double last_lidar_support_begin=-1;
@@ -172,19 +176,16 @@ public:
   deque<sensor_msgs::Imu::ConstPtr> imuBracket(double begin,double end) const;
   bool bundle_sequential_updates = false;
   bool sequential_anchor_event = false;
-  double last_camera_event_time = -1;
   uint64_t last_camera_event_stamp = 0;
   double camera_lidar_coverage = -1;
   bool prepareCameraEvent(double &timestamp,double sensor_time,bool eof);
   bool syncCameraEvent(LidarMeasureGroup &meas);
-  void saveCameraEvent();
+  void saveCameraEvent(bool save_images = true);
   ofstream camera_event_frames_log, camera_input_log;
-  double bundle_lio_time = 0;
   struct TimedWorldPoint {PointType point;V3D world;double timestamp;};
   vector<TimedWorldPoint> inter_camera_points;
   ofstream camera_events_log;
-  deque<cv::Mat> &imageBuffer() { return camera_queues.at(vio_manager->anchor_index).images; }
-  deque<double> &imageTimes() { return camera_queues.at(vio_manager->anchor_index).times; }
+  deque<MeasureGroup::Image> &anchorFrames() { return camera_queues.at(vio_manager->anchor_index).frames; }
   vector<pointWithVar> _pv_list;
   vector<double> extrinT;
   vector<double> extrinR;
@@ -195,7 +196,6 @@ public:
   PointCloudXYZI::Ptr visual_sub_map;
   PointCloudXYZI::Ptr feats_undistort;
   PointCloudXYZI::Ptr feats_down_body;
-  PointCloudXYZI::Ptr feats_down_world;
   PointCloudXYZI::Ptr pcl_w_wait_pub;
   PointCloudXYZI::Ptr pcl_b_wait_pub;
   PointCloudXYZI::Ptr pcl_wait_pub;
